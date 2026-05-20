@@ -1,9 +1,16 @@
 """
-WMS Automation Tool v3.0
+WMS Automation Tool v3.1
 ========================
 Автоматизация складской WMS-системы.
 Определяет текущее окно и выполняет нужное действие.
 Может начать с любого шага цикла.
+
+ИЗМЕНЕНИЯ v3.1:
+  - Автоопределение WMS-приложения при запуске
+  - Выбор целевого приложения из списка
+  - Поиск окон по двум бэкендам (win32 + uia)
+  - Привязка к конкретному процессу (PID)
+  - Кнопка «Обновить» для повторного сканирования
 
 Управление:
   Любая клавиша — пауза
@@ -30,6 +37,7 @@ from datetime import datetime
 try:
     import pywinauto
     from pywinauto import Desktop
+    from pywinauto.application import Application
 except ImportError:
     print("ОШИБКА: pip install pywinauto")
     sys.exit(1)
@@ -45,6 +53,11 @@ try:
 except ImportError:
     print("ОШИБКА: pip install keyboard")
     sys.exit(1)
+
+# Для получения списка процессов
+import ctypes
+from ctypes import wintypes
+import subprocess
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +91,17 @@ S_ERROR              = "ОШИБКА"
 
 FALLBACK_LOCATION = "D-KM-1"
 
+# Заголовки окон WMS, которые мы ищем при автоопределении
+WMS_KNOWN_TITLES = [
+    "Главное меню",
+    "Взятие работы",
+    "Перемещение к источнику",
+    "Поиск палеты", "Поиск паллеты",
+    "Поиск коробки",
+    "Поиск места-приёмника", "Поиск места-приемника",
+    "Размещение в место",
+]
+
 # --- UI Colors ---
 BG_DARK       = "#1a1a2e"
 BG_CARD       = "#16213e"
@@ -95,6 +119,117 @@ COLOR_YELLOW   = "#eab308"
 COLOR_YELLOW_L = "#facc15"
 COLOR_CYAN     = "#06b6d4"
 BOTTOM_BAR     = "#111827"
+COLOR_ORANGE   = "#ea580c"
+
+
+# ===================================================================
+#  Process & Window Scanner
+# ===================================================================
+class ProcessInfo:
+    """Информация о процессе для отображения в списке."""
+    def __init__(self, pid, name, title=""):
+        self.pid = pid
+        self.name = name
+        self.title = title
+
+    def __str__(self):
+        if self.title:
+            return "[PID:{}] {} — «{}»".format(self.pid, self.name, self.title)
+        return "[PID:{}] {}".format(self.pid, self.name)
+
+
+def scan_wms_windows():
+    """
+    Сканирует все окна на рабочем столе и находит те,
+    которые похожи на WMS-приложение.
+    Возвращает список ProcessInfo.
+    """
+    found = {}  # pid -> ProcessInfo
+
+    for backend in ("win32", "uia"):
+        try:
+            desktop = Desktop(backend=backend)
+            for w in desktop.windows():
+                try:
+                    title = w.window_text().strip()
+                    if not title:
+                        continue
+                    # Проверяем, совпадает ли заголовок с известными WMS-окнами
+                    for known in WMS_KNOWN_TITLES:
+                        if known.lower() in title.lower():
+                            pid = w.process_id()
+                            if pid and pid not in found:
+                                # Получаем имя процесса
+                                proc_name = _get_process_name(pid)
+                                found[pid] = ProcessInfo(pid, proc_name, title)
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return list(found.values())
+
+
+def scan_all_gui_windows():
+    """
+    Возвращает все окна верхнего уровня с видимыми заголовками.
+    Для ручного выбора пользователем.
+    """
+    found = {}  # pid -> ProcessInfo (берём первое окно)
+
+    for backend in ("win32", "uia"):
+        try:
+            desktop = Desktop(backend=backend)
+            for w in desktop.windows():
+                try:
+                    if not w.is_visible():
+                        continue
+                    title = w.window_text().strip()
+                    if not title:
+                        continue
+                    pid = w.process_id()
+                    if pid and pid > 0 and pid not in found:
+                        proc_name = _get_process_name(pid)
+                        found[pid] = ProcessInfo(pid, proc_name, title)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return sorted(found.values(), key=lambda p: p.name.lower())
+
+
+def _get_process_name(pid):
+    """Получает имя процесса по PID."""
+    try:
+        # Через tasklist
+        result = subprocess.run(
+            ["tasklist", "/FI", "PID eq {}".format(pid), "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=3
+        )
+        for line in result.stdout.strip().split("\n"):
+            parts = line.strip().strip('"').split('","')
+            if parts:
+                return parts[0].strip('"')
+    except Exception:
+        pass
+
+    try:
+        # Через ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if h:
+            buf = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(260)
+            ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+            ctypes.windll.kernel32.CloseHandle(h)
+            if buf.value:
+                return os.path.basename(buf.value)
+    except Exception:
+        pass
+
+    return "unknown"
 
 
 # ===================================================================
@@ -161,7 +296,6 @@ class ZoneLookup:
         """Автоматически ищет и загружает xlsx-файл зон из папки скрипта."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Сначала известные имена
         for name in ["zones.xlsx", "зоны.xlsx", "зона.xlsx", "zone.xlsx",
                       "файл зон.xlsx", "Файл зон.xlsx"]:
             path = os.path.join(script_dir, name)
@@ -169,7 +303,6 @@ class ZoneLookup:
                 if self.load(path):
                     return path
 
-        # Любой xlsx в папке
         for f in sorted(glob.glob(os.path.join(script_dir, "*.xlsx"))):
             if self.load(f):
                 return f
@@ -178,21 +311,59 @@ class ZoneLookup:
 
 
 # ===================================================================
-#  Window helpers
+#  Window helpers (с поддержкой target PID)
 # ===================================================================
-def find_window_by_title(pattern):
-    """Ищет окно, в заголовке которого содержится pattern."""
-    try:
-        desktop = Desktop(backend="win32")
-        for w in desktop.windows():
-            try:
-                if pattern in w.window_text():
-                    return w
-            except Exception:
-                continue
-    except Exception:
-        pass
+
+def find_window_by_title(pattern, target_pid=None):
+    """
+    Ищет окно, в заголовке которого содержится pattern.
+    Если target_pid задан — ищет только среди окон этого процесса.
+    Пробует оба бэкенда: win32 и uia.
+    """
+    for backend in ("win32", "uia"):
+        try:
+            desktop = Desktop(backend=backend)
+            for w in desktop.windows():
+                try:
+                    title = w.window_text()
+                    if pattern.lower() in title.lower():
+                        if target_pid:
+                            try:
+                                if w.process_id() != target_pid:
+                                    continue
+                            except Exception:
+                                continue
+                        return w
+                except Exception:
+                    continue
+        except Exception:
+            continue
     return None
+
+
+def find_any_wms_window(target_pid=None):
+    """
+    Ищет любое известное WMS-окно.
+    Возвращает (title, window) или (None, None).
+    """
+    # Порядок важен: сначала модальные (подтверждения, ошибки), потом основные
+    search_order = [
+        "Подтверждение", "Подтвердить", "Confirm",
+        "Информация", "Information", "Сообщение", "Message",
+        "Ошибка", "Error", "Предупреждение", "Warning",
+        "Размещение в место",
+        "Поиск места-приёмника", "Поиск места-приемника",
+        "Поиск коробки",
+        "Поиск палеты", "Поиск паллеты",
+        "Перемещение к источнику",
+        "Взятие работы",
+        "Главное меню",
+    ]
+    for title in search_order:
+        w = find_window_by_title(title, target_pid)
+        if w:
+            return title, w
+    return None, None
 
 
 def get_children_by_class(window, cls_name):
@@ -280,7 +451,6 @@ def click_ok(window):
                 return True
         except Exception:
             continue
-    # Fallback — Enter
     try:
         window.set_focus()
         time.sleep(0.05)
@@ -340,16 +510,17 @@ def find_source_and_control(edits):
 # ===================================================================
 class WMSAutomation:
 
-    def __init__(self, zone_lookup, log_cb=None, status_cb=None):
+    def __init__(self, zone_lookup, log_cb=None, status_cb=None, target_pid=None):
         self.zone_lookup = zone_lookup
         self.log_cb = log_cb
         self.status_cb = status_cb
+        self.target_pid = target_pid  # PID целевого процесса
         self.running = False
         self.paused = False
         self.poll_interval = 0.5
         self.action_delay = 0.4
         self.fallback = FALLBACK_LOCATION
-        self._suppress_kb = False   # подавление паузы при программном нажатии
+        self._suppress_kb = False
 
     def log(self, msg, level="INFO"):
         logger.log(getattr(logging, level, logging.INFO), msg)
@@ -368,27 +539,32 @@ class WMSAutomation:
     # ---------- state detection ----------
     def detect_state(self):
         """Определяет текущее состояние по заголовку окна."""
+        pid = self.target_pid
 
         # 0. Подтверждения
         for title in ("Подтверждение", "Подтвердить", "Confirm",
                        "Информация", "Information", "Сообщение", "Message"):
-            w = find_window_by_title(title)
+            w = find_window_by_title(title, pid)
             if w:
                 return S_CONFIRMATION, w
 
         # 1. Ошибки
         for title in ("Ошибка", "Error", "Предупреждение", "Warning"):
-            w = find_window_by_title(title)
+            w = find_window_by_title(title, pid)
             if w:
                 return S_ERROR, w
 
         # 2. Размещение в место
-        w = find_window_by_title("Размещение в место")
+        w = find_window_by_title("Размещение в место", pid)
         if w:
             return S_PLACE_IN_LOC, w
 
         # 3. Поиск места-приёмника
-        w = find_window_by_title("Поиск места-приёмника")
+        w = find_window_by_title("Поиск места-при", pid)  # приёмника / приемника
+        if not w:
+            w = find_window_by_title("Поиск места-приёмника", pid)
+        if not w:
+            w = find_window_by_title("Поиск места-приемника", pid)
         if w:
             statics = " ".join(get_statics(w)).lower()
             if "паллет" in statics or "содержимого" in statics:
@@ -396,28 +572,28 @@ class WMSAutomation:
             return S_SEARCH_DEST_BOX, w
 
         # 4. Поиск коробки
-        w = find_window_by_title("Поиск коробки")
+        w = find_window_by_title("Поиск коробки", pid)
         if w:
             return S_SEARCH_BOX, w
 
         # 5. Поиск палеты / паллеты
         for t in ("Поиск палеты", "Поиск паллеты"):
-            w = find_window_by_title(t)
+            w = find_window_by_title(t, pid)
             if w:
                 return S_SEARCH_PALLET, w
 
         # 6. Перемещение к источнику
-        w = find_window_by_title("Перемещение к источнику")
+        w = find_window_by_title("Перемещение к источнику", pid)
         if w:
             return S_MOVE_TO_SOURCE, w
 
         # 7. Взятие работы
-        w = find_window_by_title("Взятие работы")
+        w = find_window_by_title("Взятие работы", pid)
         if w:
             return S_TAKE_WORK, w
 
         # 8. Главное меню
-        w = find_window_by_title("Главное меню")
+        w = find_window_by_title("Главное меню", pid)
         if w:
             return S_MAIN_MENU, w
 
@@ -467,7 +643,6 @@ class WMSAutomation:
         edit_vals = [e.window_text().strip() for e in edits]
         self.log("   Поля: {}".format(edit_vals))
 
-        # Labeled: «Место» / «Из места» → «Контроль»
         source_edit = find_labeled_edit(w, "Место")
         control_edit = find_labeled_edit(w, "Контроль")
 
@@ -481,7 +656,6 @@ class WMSAutomation:
                 self._check_confirmation()
                 return
 
-        # Fallback
         src, ctrl = find_source_and_control(edits)
         if src and ctrl:
             self.log("   (fallback) '{}' → Контроль".format(src))
@@ -493,17 +667,11 @@ class WMSAutomation:
             self.log("   Не удалось найти Место/Контроль", "WARNING")
 
     def handle_search_pallet(self, w):
-        """
-        ИСПРАВЛЕНО (v3):
-        Копируем именно поле «Паллета» (не «Из места»!) в «Контроль».
-        Используем find_labeled_edit для точного определения по метке.
-        """
         self.log("→ Поиск палеты")
         edits = get_edits(w)
         edit_vals = [e.window_text().strip() for e in edits]
         self.log("   Поля: {}".format(edit_vals))
 
-        # *** КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: ищем поле именно по метке «Паллет» ***
         pallet_edit = find_labeled_edit(w, "Паллет")
         control_edit = find_labeled_edit(w, "Контроль")
 
@@ -522,7 +690,6 @@ class WMSAutomation:
             self.log("   Labeled поиск не удался (Паллет={}, Контроль={})".format(
                 pallet_edit is not None, control_edit is not None), "WARNING")
 
-        # Fallback — старый метод (берёт предыдущий непустой перед первым пустым)
         self.log("   Использую fallback-поиск...")
         src, ctrl = find_source_and_control(edits)
         if src and ctrl:
@@ -540,7 +707,6 @@ class WMSAutomation:
         edit_vals = [e.window_text().strip() for e in edits]
         self.log("   Поля: {}".format(edit_vals))
 
-        # Labeled: «Коробка» → «Контроль»
         box_edit = find_labeled_edit(w, "Коробк")
         control_edit = find_labeled_edit(w, "Контроль")
 
@@ -554,7 +720,6 @@ class WMSAutomation:
                 self._check_confirmation()
                 return
 
-        # Fallback
         src, ctrl = find_source_and_control(edits)
         if src and ctrl:
             self.log("   (fallback) '{}' → Контроль".format(src))
@@ -576,7 +741,6 @@ class WMSAutomation:
         edit_vals = [e.window_text().strip() for e in edits]
         self.log("   Поля: {}".format(edit_vals))
 
-        # Извлекаем зону
         zone_text = ""
         m = re.search(r"[Зз]она[:\s]+(.+)", full_text)
         if m:
@@ -588,7 +752,6 @@ class WMSAutomation:
 
         self.log("   Зона: '{}'".format(zone_text))
 
-        # Ищем код в справочнике
         location = None
         if zone_text:
             location = self.zone_lookup.lookup(zone_text)
@@ -599,7 +762,6 @@ class WMSAutomation:
             location = self.fallback
             self.log("   Зона не найдена → fallback {}".format(location), "WARNING")
 
-        # Вставляем в Контроль
         ctrl = find_labeled_edit(w, "Контроль")
         if not ctrl:
             for ed in edits:
@@ -614,7 +776,6 @@ class WMSAutomation:
             time.sleep(0.15)
             click_ok(w)
 
-            # Проверяем ошибку / подтверждение
             time.sleep(0.8)
             st, ew = self.detect_state()
             if st == S_ERROR:
@@ -671,10 +832,8 @@ class WMSAutomation:
         self._check_confirmation()
 
     def handle_confirmation(self, w):
-        """Обработка окна подтверждения — сразу Ок."""
         self.log("→ Подтверждение: нажимаю Ок")
         click_ok(w)
-        # Цепочка: может вылезти ещё одно
         time.sleep(0.3)
         st, w2 = self.detect_state()
         if st == S_CONFIRMATION:
@@ -694,8 +853,9 @@ class WMSAutomation:
         self.running = True
         self.log("=" * 50)
         self.log("Автоматизация запущена")
-        self.log("Fallback: {}  |  Зон: {}".format(
-            self.fallback, len(self.zone_lookup.mapping)))
+        self.log("Fallback: {}  |  Зон: {}  |  PID: {}".format(
+            self.fallback, len(self.zone_lookup.mapping),
+            self.target_pid or "все процессы"))
         self.log("=" * 50)
 
         handlers = {
@@ -759,12 +919,11 @@ class AppGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WMS Автоматизация v3.0")
-        self.root.geometry("920x680")
+        self.root.title("WMS Автоматизация v3.1")
+        self.root.geometry("960x760")
         self.root.configure(bg=BG_DARK)
         self.root.resizable(True, True)
 
-        # Иконка (если доступна)
         try:
             self.root.iconbitmap(default="")
         except Exception:
@@ -776,13 +935,20 @@ class AppGUI:
 
         self._arrow_x = -100
         self._anim_running = False
-        self._status_mode = "stopped"  # stopped | paused | running
+        self._status_mode = "stopped"
+
+        # Выбранный PID WMS-приложения (None = все процессы)
+        self._selected_pid = None
+        self._process_list = []  # список ProcessInfo
 
         self._configure_styles()
         self._build_ui()
 
         # Автозагрузка зон
         self.root.after(200, self._auto_load_zones)
+
+        # Автосканирование WMS-окон
+        self.root.after(500, self._auto_scan_wms)
 
         # Хук: любая клавиша → пауза
         self._kb_hook = keyboard.on_press(self._on_any_key_press)
@@ -807,6 +973,10 @@ class AppGUI:
         style.configure("Dark.TLabelframe.Label", background=BG_CARD,
                          foreground=COLOR_CYAN, font=("Segoe UI", 10, "bold"))
 
+        style.configure("Dark.TCombobox",
+                         fieldbackground=BG_INPUT, background=BG_INPUT,
+                         foreground=FG_TEXT, selectbackground=COLOR_BLUE)
+
     # ----------------------------------------------------------------
     def _build_ui(self):
 
@@ -820,6 +990,47 @@ class AppGUI:
         # ===== ОСНОВНАЯ ОБЛАСТЬ =====
         main_frame = ttk.Frame(self.root, style="Dark.TFrame")
         main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+
+        # --- Выбор WMS-приложения ---
+        frm_app = ttk.LabelFrame(main_frame, text="🖥  WMS-приложение",
+                                   style="Dark.TLabelframe")
+        frm_app.pack(fill=tk.X, pady=(0, 6))
+
+        row_app = ttk.Frame(frm_app, style="Card.TFrame")
+        row_app.pack(fill=tk.X, padx=8, pady=6)
+
+        ttk.Label(row_app, text="Приложение:", style="Card.TLabel") \
+            .pack(side=tk.LEFT)
+
+        self.var_app = tk.StringVar(value="(автоопределение...)")
+        self.cmb_app = ttk.Combobox(
+            row_app, textvariable=self.var_app, width=60,
+            state="readonly", font=("Segoe UI", 9)
+        )
+        self.cmb_app.pack(side=tk.LEFT, padx=8)
+        self.cmb_app.bind("<<ComboboxSelected>>", self._on_app_selected)
+
+        self.btn_scan = tk.Button(
+            row_app, text="🔍 Сканировать", command=self._scan_apps,
+            bg=COLOR_BLUE, fg="white", activebackground=COLOR_BLUE_D,
+            relief="flat", font=("Segoe UI", 9, "bold"),
+            padx=10, cursor="hand2"
+        )
+        self.btn_scan.pack(side=tk.LEFT, padx=4)
+
+        self.btn_scan_all = tk.Button(
+            row_app, text="📋 Все окна", command=self._scan_all_apps,
+            bg="#374151", fg=FG_TEXT, activebackground="#4b5563",
+            relief="flat", font=("Segoe UI", 9),
+            padx=10, cursor="hand2"
+        )
+        self.btn_scan_all.pack(side=tk.LEFT, padx=4)
+
+        # Статус определения
+        self.lbl_app_status = ttk.Label(
+            frm_app, text="", style="Card.TLabel"
+        )
+        self.lbl_app_status.pack(anchor=tk.W, padx=12, pady=(0, 4))
 
         # --- Настройки ---
         frm_set = ttk.LabelFrame(main_frame, text="⚙  Настройки",
@@ -854,10 +1065,10 @@ class AppGUI:
         self.lbl_zones_count = ttk.Label(row2, text="Зон: 0", style="Card.TLabel")
         self.lbl_zones_count.pack(side=tk.RIGHT, padx=10)
 
-        # --- Таблица зон (для вставки образцы) ---
+        # --- Таблица зон ---
         frm_zones = ttk.LabelFrame(
             main_frame,
-            text="📋  Для вставки образцы (загруженные зоны)",
+            text="📋  Загруженные зоны",
             style="Dark.TLabelframe"
         )
         frm_zones.pack(fill=tk.X, pady=(0, 6))
@@ -897,7 +1108,6 @@ class AppGUI:
         bottom = tk.Frame(self.root, bg=BOTTOM_BAR)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
 
-        # Подсказка
         tk.Label(
             bottom,
             text="💡 Любая клавиша = пауза   |   Кнопки ниже для управления",
@@ -923,6 +1133,14 @@ class AppGUI:
         )
         self.btn_pause.pack(side=tk.LEFT, padx=10)
 
+        self.btn_stop = tk.Button(
+            btn_frame, text="⏹  Стоп", command=self._on_stop,
+            bg=COLOR_ORANGE, fg="white", activebackground="#f97316",
+            relief="flat", font=("Segoe UI", 12, "bold"),
+            padx=24, pady=8, cursor="hand2", state=tk.DISABLED
+        )
+        self.btn_stop.pack(side=tk.LEFT, padx=10)
+
         self.btn_exit = tk.Button(
             btn_frame, text="✕  Выход", command=self._on_close,
             bg=COLOR_RED, fg="white", activebackground=COLOR_RED_L,
@@ -942,30 +1160,25 @@ class AppGUI:
 
         if self._status_mode == "running":
             c.configure(bg=COLOR_GREEN)
-            # Бегущие стрелки
             for i in range(10):
                 ax = self._arrow_x + i * 50
                 if -30 < ax < w + 30:
-                    # Полупрозрачные «›» (более тёмный зелёный)
                     c.create_text(
                         ax, h // 2, text="›",
                         fill=COLOR_GREEN_L,
                         font=("Segoe UI", 30, "bold")
                     )
-            # Надпись всегда по центру
             c.create_text(
                 w // 2, h // 2, text="▶  ИДЁТ ПЕРЕМЕЩЕНИЕ",
                 fill="white", font=("Segoe UI", 16, "bold")
             )
-
         elif self._status_mode == "paused":
             c.configure(bg=COLOR_BLUE)
             c.create_text(
                 w // 2, h // 2, text="⏸  ПАУЗА",
                 fill="white", font=("Segoe UI", 16, "bold")
             )
-
-        else:  # stopped
+        else:
             c.configure(bg=COLOR_BLUE)
             c.create_text(
                 w // 2, h // 2, text="⏹  ПРОГРАММА НЕ ЗАПУЩЕНА",
@@ -985,7 +1198,7 @@ class AppGUI:
         if not self._anim_running:
             return
         if self._status_mode == "running":
-            w = self.status_canvas.winfo_width() or 920
+            w = self.status_canvas.winfo_width() or 960
             self._arrow_x += 4
             if self._arrow_x > w + 50:
                 self._arrow_x = -500
@@ -993,12 +1206,123 @@ class AppGUI:
         self.root.after(50, self._animate_tick)
 
     def _set_status_mode(self, mode):
-        """mode: 'stopped' | 'paused' | 'running'"""
         self._status_mode = mode
         if mode == "running":
             self._start_animation()
         else:
             self._draw_status()
+
+    # ================================================================
+    #  App scanning
+    # ================================================================
+    def _auto_scan_wms(self):
+        """Автосканирование WMS при запуске."""
+        self._add_log("🔍 Автосканирование WMS-окон...")
+
+        def _do_scan():
+            procs = scan_wms_windows()
+            self.root.after(0, lambda: self._apply_scan_results(procs, auto=True))
+
+        threading.Thread(target=_do_scan, daemon=True).start()
+
+    def _scan_apps(self):
+        """Кнопка «Сканировать» — ищет только WMS-окна."""
+        self._add_log("🔍 Сканирование WMS-окон...")
+        self.btn_scan.config(state=tk.DISABLED)
+
+        def _do_scan():
+            procs = scan_wms_windows()
+            self.root.after(0, lambda: self._apply_scan_results(procs, auto=False))
+            self.root.after(0, lambda: self.btn_scan.config(state=tk.NORMAL))
+
+        threading.Thread(target=_do_scan, daemon=True).start()
+
+    def _scan_all_apps(self):
+        """Кнопка «Все окна» — показывает все GUI-приложения."""
+        self._add_log("📋 Сканирование всех окон...")
+        self.btn_scan_all.config(state=tk.DISABLED)
+
+        def _do_scan():
+            procs = scan_all_gui_windows()
+            self.root.after(0, lambda: self._apply_scan_results(procs, auto=False, all_mode=True))
+            self.root.after(0, lambda: self.btn_scan_all.config(state=tk.NORMAL))
+
+        threading.Thread(target=_do_scan, daemon=True).start()
+
+    def _apply_scan_results(self, procs, auto=False, all_mode=False):
+        """Применяет результаты сканирования к ComboBox."""
+        self._process_list = procs
+
+        # Формируем варианты для ComboBox
+        values = ["(Все процессы — без фильтра)"]
+        for p in procs:
+            values.append(str(p))
+
+        self.cmb_app["values"] = values
+
+        if len(procs) == 0:
+            self.var_app.set("(Все процессы — без фильтра)")
+            self._selected_pid = None
+            if auto:
+                self.lbl_app_status.config(
+                    text="⚠ WMS-окна не найдены. Нажмите «Сканировать» или «Все окна» для выбора.",
+                    foreground=COLOR_YELLOW
+                )
+                self._add_log("⚠ WMS-окна не найдены автоматически. "
+                              "Откройте WMS и нажмите «Сканировать».")
+            else:
+                if all_mode:
+                    self.lbl_app_status.config(
+                        text="Найдено {} окон. Выберите нужное.".format(len(procs)),
+                        foreground=FG_TEXT
+                    )
+                else:
+                    self.lbl_app_status.config(
+                        text="⚠ WMS-окна не найдены. Попробуйте «Все окна».",
+                        foreground=COLOR_YELLOW
+                    )
+        elif len(procs) == 1:
+            # Автовыбор единственного
+            self._selected_pid = procs[0].pid
+            self.var_app.set(str(procs[0]))
+            self.lbl_app_status.config(
+                text="✅ Найдено WMS-приложение: {} (PID:{})".format(
+                    procs[0].name, procs[0].pid),
+                foreground=COLOR_GREEN_L
+            )
+            self._add_log("✅ WMS найден: {} (PID:{})".format(
+                procs[0].name, procs[0].pid))
+        else:
+            # Несколько — автовыбор первого
+            self._selected_pid = procs[0].pid
+            self.var_app.set(str(procs[0]))
+            self.lbl_app_status.config(
+                text="✅ Найдено {} приложений. Выбрано: {} (PID:{})".format(
+                    len(procs), procs[0].name, procs[0].pid),
+                foreground=COLOR_GREEN_L
+            )
+            self._add_log("✅ Найдено {} WMS-окон. Выбрано: {} (PID:{})".format(
+                len(procs), procs[0].name, procs[0].pid))
+
+    def _on_app_selected(self, event=None):
+        """Пользователь выбрал приложение из списка."""
+        idx = self.cmb_app.current()
+        if idx <= 0:
+            # «Все процессы»
+            self._selected_pid = None
+            self.lbl_app_status.config(
+                text="ℹ Работа без фильтра по процессу",
+                foreground=COLOR_CYAN
+            )
+            self._add_log("ℹ Выбран режим: все процессы (без фильтра)")
+        else:
+            proc = self._process_list[idx - 1]
+            self._selected_pid = proc.pid
+            self.lbl_app_status.config(
+                text="✅ Выбрано: {} (PID:{})".format(proc.name, proc.pid),
+                foreground=COLOR_GREEN_L
+            )
+            self._add_log("✅ Выбрано: {} (PID:{})".format(proc.name, proc.pid))
 
     # ================================================================
     #  Auto-load zones
@@ -1054,11 +1378,9 @@ class AppGUI:
         self.txt_log.config(state=tk.DISABLED)
 
     def _status_callback(self, mode):
-        """Вызывается из потока автоматизации."""
         self.root.after(0, lambda m=mode: self._set_status_mode(m))
 
     def _on_any_key_press(self, event):
-        """Любая физическая клавиша → пауза."""
         if (self.automation
                 and self.automation.running
                 and not self.automation.paused
@@ -1079,7 +1401,8 @@ class AppGUI:
         self.automation = WMSAutomation(
             self.zone_lookup,
             log_cb=self._add_log,
-            status_cb=self._status_callback
+            status_cb=self._status_callback,
+            target_pid=self._selected_pid
         )
         self.automation.fallback = fb
         try:
@@ -1092,6 +1415,7 @@ class AppGUI:
 
         self.btn_start.config(state=tk.DISABLED, bg="#374151")
         self.btn_pause.config(state=tk.NORMAL, text="⏸  Пауза")
+        self.btn_stop.config(state=tk.NORMAL)
         self._set_status_mode("running")
 
     def _on_pause(self):
@@ -1109,6 +1433,7 @@ class AppGUI:
             self.automation.stop()
         self.btn_start.config(state=tk.NORMAL, bg=COLOR_GREEN)
         self.btn_pause.config(state=tk.DISABLED, text="⏸  Пауза")
+        self.btn_stop.config(state=tk.DISABLED)
         self._stop_animation()
         self._set_status_mode("stopped")
 
