@@ -1,26 +1,23 @@
 """
-WMS Automation Tool v3.1
+WMS Automation Tool v4.0
 ========================
-Автоматизация складской WMS-системы.
-Определяет текущее окно и выполняет нужное действие.
-Может начать с любого шага цикла.
+Циклическая автоматизация WMS.
+Может начать с ЛЮБОГО шага цикла.
 
-ИЗМЕНЕНИЯ v3.1:
-  - Автоопределение WMS-приложения при запуске
-  - Выбор целевого приложения из списка
-  - Поиск окон по двум бэкендам (win32 + uia)
-  - Привязка к конкретному процессу (PID)
-  - Кнопка «Обновить» для повторного сканирования
+Цикл (по скриншотам 1-12):
+  1.  Главное меню         → жмём F2 (Запросить работу)
+  2.  Взятие работы        → жмём F2 (Взять работу)
+  3-4. Перемещение к источнику → копируем Место → Контроль → Ок
+  5-6. Поиск паллеты       → копируем Паллета → Контроль → Ок
+  7-8. Поиск коробки       → копируем Коробка → Контроль → Ок
+  9-10. Поиск места-приёмника (коробка) → зона из XLS → Контроль → Ок
+       (если ошибка → D-KM-1)
+  11. Размещение в место   → жмём Ок
+  12. Поиск места-приёмника (паллета) → ВСЕГДА D-KM-1 → Ок
+  → цикл заново с шага 1
 
-Управление:
-  Любая клавиша — пауза
-  Кнопки интерфейса — управление
-
-Установка:
-  pip install pywinauto openpyxl keyboard
-
-Запуск (от имени администратора!):
-  python wms_auto.py
+Установка:  pip install pywinauto openpyxl keyboard
+Запуск:     python wms_auto.py  (от имени администратора)
 """
 
 import time
@@ -37,7 +34,6 @@ from datetime import datetime
 try:
     import pywinauto
     from pywinauto import Desktop
-    from pywinauto.application import Application
 except ImportError:
     print("ОШИБКА: pip install pywinauto")
     sys.exit(1)
@@ -54,14 +50,8 @@ except ImportError:
     print("ОШИБКА: pip install keyboard")
     sys.exit(1)
 
-# Для получения списка процессов
-import ctypes
-from ctypes import wintypes
 import subprocess
 
-
-# ---------------------------------------------------------------------------
-#  Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.DEBUG,
@@ -73,802 +63,732 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WMS")
 
-
 # ---------------------------------------------------------------------------
-#  Constants & Colors
+#  Константы
 # ---------------------------------------------------------------------------
-S_UNKNOWN            = "UNKNOWN"
-S_MAIN_MENU          = "ГЛАВНОЕ_МЕНЮ"
-S_TAKE_WORK          = "ВЗЯТИЕ_РАБОТЫ"
-S_MOVE_TO_SOURCE     = "ПЕРЕМЕЩЕНИЕ_К_ИСТОЧНИКУ"
-S_SEARCH_PALLET      = "ПОИСК_ПАЛЕТЫ"
-S_SEARCH_BOX         = "ПОИСК_КОРОБКИ"
-S_SEARCH_DEST_BOX    = "ПОИСК_МЕСТА_КОРОБКА"
-S_SEARCH_DEST_PALLET = "ПОИСК_МЕСТА_ПАЛЕТА"
-S_PLACE_IN_LOC       = "РАЗМЕЩЕНИЕ_В_МЕСТО"
-S_CONFIRMATION       = "ПОДТВЕРЖДЕНИЕ"
-S_ERROR              = "ОШИБКА"
-
 FALLBACK_LOCATION = "D-KM-1"
 
-# Заголовки окон WMS, которые мы ищем при автоопределении
-WMS_KNOWN_TITLES = [
-    "Главное меню",
-    "Взятие работы",
-    "Перемещение к источнику",
-    "Поиск палеты", "Поиск паллеты",
-    "Поиск коробки",
-    "Поиск места-приёмника", "Поиск места-приемника",
-    "Размещение в место",
-]
-
-# --- UI Colors ---
-BG_DARK       = "#1a1a2e"
-BG_CARD       = "#16213e"
-BG_INPUT      = "#1c2a4a"
-FG_TEXT        = "#e0e0e0"
-FG_DIM         = "#7a7a9a"
-COLOR_BLUE     = "#2563eb"
-COLOR_BLUE_D   = "#1d4ed8"
-COLOR_GREEN    = "#16a34a"
-COLOR_GREEN_L  = "#22c55e"
-COLOR_GREEN_D  = "#15803d"
-COLOR_RED      = "#dc2626"
-COLOR_RED_L    = "#ef4444"
-COLOR_YELLOW   = "#eab308"
-COLOR_YELLOW_L = "#facc15"
-COLOR_CYAN     = "#06b6d4"
-BOTTOM_BAR     = "#111827"
-COLOR_ORANGE   = "#ea580c"
+# UI
+BG_DARK    = "#1a1a2e"
+BG_CARD    = "#16213e"
+BG_INPUT   = "#1c2a4a"
+FG_TEXT    = "#e0e0e0"
+FG_DIM     = "#7a7a9a"
+C_BLUE     = "#2563eb"
+C_BLUE_D   = "#1d4ed8"
+C_GREEN    = "#16a34a"
+C_GREEN_L  = "#22c55e"
+C_RED      = "#dc2626"
+C_RED_L    = "#ef4444"
+C_YELLOW   = "#eab308"
+C_YELLOW_L = "#facc15"
+C_CYAN     = "#06b6d4"
+C_ORANGE   = "#ea580c"
+BAR_BG     = "#111827"
 
 
 # ===================================================================
-#  Process & Window Scanner
-# ===================================================================
-class ProcessInfo:
-    """Информация о процессе для отображения в списке."""
-    def __init__(self, pid, name, title=""):
-        self.pid = pid
-        self.name = name
-        self.title = title
-
-    def __str__(self):
-        if self.title:
-            return "[PID:{}] {} — «{}»".format(self.pid, self.name, self.title)
-        return "[PID:{}] {}".format(self.pid, self.name)
-
-
-def scan_wms_windows():
-    """
-    Сканирует все окна на рабочем столе и находит те,
-    которые похожи на WMS-приложение.
-    Возвращает список ProcessInfo.
-    """
-    found = {}  # pid -> ProcessInfo
-
-    for backend in ("win32", "uia"):
-        try:
-            desktop = Desktop(backend=backend)
-            for w in desktop.windows():
-                try:
-                    title = w.window_text().strip()
-                    if not title:
-                        continue
-                    # Проверяем, совпадает ли заголовок с известными WMS-окнами
-                    for known in WMS_KNOWN_TITLES:
-                        if known.lower() in title.lower():
-                            pid = w.process_id()
-                            if pid and pid not in found:
-                                # Получаем имя процесса
-                                proc_name = _get_process_name(pid)
-                                found[pid] = ProcessInfo(pid, proc_name, title)
-                            break
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    return list(found.values())
-
-
-def scan_all_gui_windows():
-    """
-    Возвращает все окна верхнего уровня с видимыми заголовками.
-    Для ручного выбора пользователем.
-    """
-    found = {}  # pid -> ProcessInfo (берём первое окно)
-
-    for backend in ("win32", "uia"):
-        try:
-            desktop = Desktop(backend=backend)
-            for w in desktop.windows():
-                try:
-                    if not w.is_visible():
-                        continue
-                    title = w.window_text().strip()
-                    if not title:
-                        continue
-                    pid = w.process_id()
-                    if pid and pid > 0 and pid not in found:
-                        proc_name = _get_process_name(pid)
-                        found[pid] = ProcessInfo(pid, proc_name, title)
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    return sorted(found.values(), key=lambda p: p.name.lower())
-
-
-def _get_process_name(pid):
-    """Получает имя процесса по PID."""
-    try:
-        # Через tasklist
-        result = subprocess.run(
-            ["tasklist", "/FI", "PID eq {}".format(pid), "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=3
-        )
-        for line in result.stdout.strip().split("\n"):
-            parts = line.strip().strip('"').split('","')
-            if parts:
-                return parts[0].strip('"')
-    except Exception:
-        pass
-
-    try:
-        # Через ctypes
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if h:
-            buf = ctypes.create_unicode_buffer(260)
-            size = wintypes.DWORD(260)
-            ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
-            ctypes.windll.kernel32.CloseHandle(h)
-            if buf.value:
-                return os.path.basename(buf.value)
-    except Exception:
-        pass
-
-    return "unknown"
-
-
-# ===================================================================
-#  Zone Lookup from Excel
+#  ZoneLookup — чтение XLS
 # ===================================================================
 class ZoneLookup:
-    """
-    Читает Excel-файл (первый лист):
-      столбец A — ключевое слово / название зоны
-      столбец B — код места
-    """
-
-    def __init__(self, path=None):
-        self.mapping = {}           # {lower_key: code}
-        self.display_mapping = {}   # {original_key: code}  для отображения
-        self.source_path = None
-        if path:
-            self.load(path)
+    def __init__(self):
+        self.mapping = {}
+        self.display = {}
+        self.path = None
 
     def load(self, path):
-        if not os.path.exists(path):
-            logger.warning("Файл зон не найден: %s", path)
+        if not path or not os.path.exists(path):
             return False
         try:
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
             ws = wb.active
             self.mapping.clear()
-            self.display_mapping.clear()
+            self.display.clear()
             for row in ws.iter_rows(min_row=1, values_only=True):
                 if row and len(row) >= 2 and row[0] and row[1]:
-                    key_orig = str(row[0]).strip()
-                    val = str(row[1]).strip()
-                    self.mapping[key_orig.lower()] = val
-                    self.display_mapping[key_orig] = val
+                    k = str(row[0]).strip()
+                    v = str(row[1]).strip()
+                    self.mapping[k.lower()] = v
+                    self.display[k] = v
             wb.close()
-            self.source_path = path
-            logger.info("Загружено %d зон из %s", len(self.mapping), path)
+            self.path = path
             return True
-        except Exception as exc:
-            logger.error("Ошибка загрузки зон: %s", exc)
+        except Exception as e:
+            logger.error("Ошибка загрузки XLS: %s", e)
             return False
 
     def lookup(self, zone_text):
-        """Ищет подходящий код места для текста зоны."""
         zt = zone_text.lower().strip()
-
-        # 1. Точное совпадение
+        # точное
         if zt in self.mapping:
             return self.mapping[zt]
-
-        # 2. Ключ содержится в zone_text
-        for key, code in self.mapping.items():
-            if key in zt:
-                return code
-
-        # 3. zone_text содержится в ключе
-        for key, code in self.mapping.items():
-            if zt in key:
-                return code
-
+        # ключ содержится в тексте
+        for k, v in self.mapping.items():
+            if k in zt:
+                return v
+        # текст содержится в ключе
+        for k, v in self.mapping.items():
+            if zt in k:
+                return v
         return None
 
-    def auto_find_and_load(self):
-        """Автоматически ищет и загружает xlsx-файл зон из папки скрипта."""
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-        for name in ["zones.xlsx", "зоны.xlsx", "зона.xlsx", "zone.xlsx",
-                      "файл зон.xlsx", "Файл зон.xlsx"]:
-            path = os.path.join(script_dir, name)
-            if os.path.exists(path):
-                if self.load(path):
-                    return path
-
-        for f in sorted(glob.glob(os.path.join(script_dir, "*.xlsx"))):
+    def auto_find(self):
+        d = os.path.dirname(os.path.abspath(__file__))
+        for name in ["zones.xlsx", "зоны.xlsx", "зона.xlsx", "zone.xlsx"]:
+            p = os.path.join(d, name)
+            if os.path.exists(p) and self.load(p):
+                return p
+        for f in sorted(glob.glob(os.path.join(d, "*.xlsx"))):
             if self.load(f):
                 return f
-
         return None
 
 
 # ===================================================================
-#  Window helpers (с поддержкой target PID)
+#  Поиск окон — ПРОСТОЙ И НАДЁЖНЫЙ
 # ===================================================================
 
-def find_window_by_title(pattern, target_pid=None):
-    """
-    Ищет окно, в заголовке которого содержится pattern.
-    Если target_pid задан — ищет только среди окон этого процесса.
-    Пробует оба бэкенда: win32 и uia.
-    """
+def _get_all_windows():
+    """Получить все окна через оба бэкенда."""
+    windows = []
     for backend in ("win32", "uia"):
         try:
-            desktop = Desktop(backend=backend)
-            for w in desktop.windows():
+            for w in Desktop(backend=backend).windows():
                 try:
-                    title = w.window_text()
-                    if pattern.lower() in title.lower():
-                        if target_pid:
-                            try:
-                                if w.process_id() != target_pid:
-                                    continue
-                            except Exception:
-                                continue
-                        return w
-                except Exception:
+                    t = w.window_text()
+                    if t:
+                        windows.append((t, w, backend))
+                except:
+                    pass
+        except:
+            pass
+    return windows
+
+
+def find_window(title_part, pid=None):
+    """Найти окно по части заголовка. Возвращает wrapper или None."""
+    title_lower = title_part.lower()
+    for t, w, be in _get_all_windows():
+        if title_lower in t.lower():
+            if pid:
+                try:
+                    if w.process_id() != pid:
+                        continue
+                except:
                     continue
-        except Exception:
-            continue
+            return w
     return None
 
 
-def find_any_wms_window(target_pid=None):
-    """
-    Ищет любое известное WMS-окно.
-    Возвращает (title, window) или (None, None).
-    """
-    # Порядок важен: сначала модальные (подтверждения, ошибки), потом основные
-    search_order = [
-        "Подтверждение", "Подтвердить", "Confirm",
-        "Информация", "Information", "Сообщение", "Message",
-        "Ошибка", "Error", "Предупреждение", "Warning",
-        "Размещение в место",
-        "Поиск места-приёмника", "Поиск места-приемника",
-        "Поиск коробки",
-        "Поиск палеты", "Поиск паллеты",
-        "Перемещение к источнику",
-        "Взятие работы",
-        "Главное меню",
-    ]
-    for title in search_order:
-        w = find_window_by_title(title, target_pid)
-        if w:
-            return title, w
-    return None, None
+def find_wms_processes():
+    """Найти процессы с WMS-окнами."""
+    known = ["главное меню", "взятие работы", "перемещение к источнику",
+             "поиск паллеты", "поиск палеты", "поиск коробки",
+             "поиск места-приёмника", "поиск места-приемника",
+             "размещение в место"]
+    found = {}
+    for t, w, be in _get_all_windows():
+        tl = t.lower()
+        for k in known:
+            if k in tl:
+                try:
+                    p = w.process_id()
+                    if p and p not in found:
+                        name = _proc_name(p)
+                        found[p] = (p, name, t)
+                except:
+                    pass
+                break
+    return list(found.values())
 
 
-def get_children_by_class(window, cls_name):
-    """Возвращает дочерние контролы определённого класса."""
+def find_all_visible():
+    """Все видимые окна для ручного выбора."""
+    found = {}
+    for t, w, be in _get_all_windows():
+        try:
+            if not w.is_visible():
+                continue
+            p = w.process_id()
+            if p and p > 0 and p not in found:
+                found[p] = (p, _proc_name(p), t)
+        except:
+            pass
+    return sorted(found.values(), key=lambda x: x[1].lower())
+
+
+def _proc_name(pid):
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=3)
+        for line in r.stdout.strip().split("\n"):
+            parts = line.replace('"', '').split(",")
+            if parts:
+                return parts[0].strip()
+    except:
+        pass
+    return "?"
+
+
+# ===================================================================
+#  Работа с контролами окна
+# ===================================================================
+
+def get_edits(win):
+    """Все Edit-контролы окна."""
     result = []
     try:
-        for child in window.children():
+        for c in win.children():
             try:
-                cn = child.class_name()
-                if cls_name.lower() in cn.lower():
-                    result.append(child)
-            except Exception:
-                continue
-    except Exception:
+                if "edit" in c.class_name().lower():
+                    result.append(c)
+            except:
+                pass
+    except:
         pass
     return result
 
 
-def get_edits(window):
-    return get_children_by_class(window, "Edit")
-
-
-def get_statics(window):
+def get_statics(win):
+    """Все тексты Static-контролов."""
     texts = []
-    for ctrl in get_children_by_class(window, "Static"):
-        try:
-            texts.append(ctrl.window_text())
-        except Exception:
-            pass
+    try:
+        for c in win.children():
+            try:
+                if "static" in c.class_name().lower():
+                    t = c.window_text()
+                    if t:
+                        texts.append(t)
+            except:
+                pass
+    except:
+        pass
     return texts
 
 
-def find_labeled_edit(window, label_text):
-    """
-    Находит Edit-контрол, расположенный на той же строке,
-    что и Static-метка содержащая label_text.
-    Сопоставление по вертикальной близости (±25 px).
-    """
-    statics = get_children_by_class(window, "Static")
-    edits = get_children_by_class(window, "Edit")
-
-    target_static = None
-    for s in statics:
-        try:
-            txt = s.window_text().strip()
-            if label_text.lower() in txt.lower():
-                target_static = s
-                break
-        except Exception:
-            continue
-
-    if not target_static:
-        return None
-
+def get_buttons(win):
+    """Все кнопки."""
+    result = []
     try:
-        sr = target_static.rectangle()
-        static_cy = (sr.top + sr.bottom) // 2
+        for c in win.children():
+            try:
+                if "button" in c.class_name().lower():
+                    result.append(c)
+            except:
+                pass
+    except:
+        pass
+    return result
+
+
+def read_edit_value(edit):
+    """Прочитать значение из Edit (точное чтение через Win32 API)."""
+    try:
+        return edit.window_text().strip()
+    except:
+        return ""
+
+
+def write_edit_value(edit, value):
+    """Записать значение в Edit."""
+    try:
+        edit.set_focus()
+        time.sleep(0.05)
+        edit.set_edit_text("")
+        time.sleep(0.05)
+        edit.set_edit_text(value)
+        time.sleep(0.05)
     except Exception:
-        return None
-
-    best_edit = None
-    best_dist = 999999
-
-    for ed in edits:
         try:
-            er = ed.rectangle()
-            edit_cy = (er.top + er.bottom) // 2
-            dist = abs(edit_cy - static_cy)
-            if dist < 25 and dist < best_dist:
-                best_dist = dist
-                best_edit = ed
-        except Exception:
-            continue
-
-    return best_edit
-
-
-def click_ok(window):
-    """Нажимает кнопку Ок / Ok / OK в окне."""
-    for ctrl in get_children_by_class(window, "Button"):
-        try:
-            txt = ctrl.window_text().strip().lower()
-            if txt in ("ок", "ok", "оk", "oк"):
-                ctrl.click()
-                return True
-        except Exception:
-            continue
-    try:
-        window.set_focus()
-        time.sleep(0.05)
-        keyboard.send("enter")
-        return True
-    except Exception:
-        return False
-
-
-def click_button(window, text_part):
-    for ctrl in get_children_by_class(window, "Button"):
-        try:
-            if text_part.lower() in ctrl.window_text().lower():
-                ctrl.click()
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def set_edit_value(edit_ctrl, value):
-    """Очищает поле и вводит значение."""
-    try:
-        edit_ctrl.set_focus()
-        time.sleep(0.05)
-        edit_ctrl.set_edit_text("")
-        time.sleep(0.05)
-        edit_ctrl.set_edit_text(value)
-    except Exception as exc:
-        logger.error("set_edit_value error: %s", exc)
-        try:
-            edit_ctrl.set_focus()
+            edit.set_focus()
+            time.sleep(0.05)
             keyboard.send("ctrl+a")
             time.sleep(0.05)
             keyboard.write(value, delay=0.02)
-        except Exception:
+        except:
             pass
 
 
-def find_source_and_control(edits):
-    """Fallback: первый пустой Edit = контроль, предыдущий непустой = источник."""
-    for i, ed in enumerate(edits):
-        val = ed.window_text().strip()
-        if not val:
-            source_val = None
-            for j in range(i - 1, -1, -1):
-                sv = edits[j].window_text().strip()
-                if sv:
-                    source_val = sv
-                    break
-            return source_val, ed
-    return None, None
+def click_button_text(win, *texts):
+    """Нажать кнопку, текст которой содержит одну из строк."""
+    for btn in get_buttons(win):
+        try:
+            bt = btn.window_text().strip().lower()
+            for t in texts:
+                if t.lower() in bt:
+                    btn.click()
+                    return True
+        except:
+            pass
+    return False
+
+
+def click_ok(win):
+    """Нажать Ок."""
+    return click_button_text(win, "ок", "ok", "oк", "оk")
+
+
+def click_f2_button(win):
+    """Нажать кнопку F2 / Запросить / Взять."""
+    return click_button_text(win, "f2", "запросить", "взять")
+
+
+def find_edit_near_label(win, label_part):
+    """
+    Найти Edit рядом с меткой (по вертикали ±30px).
+    Это КЛЮЧЕВОЙ метод — читает данные из конкретного поля.
+    """
+    statics = []
+    edits = []
+    try:
+        for c in win.children():
+            try:
+                cn = c.class_name().lower()
+                if "static" in cn:
+                    statics.append(c)
+                elif "edit" in cn:
+                    edits.append(c)
+            except:
+                pass
+    except:
+        pass
+
+    # Ищем нужный Static
+    target = None
+    for s in statics:
+        try:
+            if label_part.lower() in s.window_text().lower():
+                target = s
+                break
+        except:
+            pass
+
+    if not target:
+        return None
+
+    # Ищем ближайший Edit по вертикали
+    try:
+        sr = target.rectangle()
+        sy = (sr.top + sr.bottom) // 2
+    except:
+        return None
+
+    best = None
+    best_d = 9999
+    for e in edits:
+        try:
+            er = e.rectangle()
+            ey = (er.top + er.bottom) // 2
+            d = abs(ey - sy)
+            if d < 30 and d < best_d:
+                best_d = d
+                best = e
+        except:
+            pass
+    return best
 
 
 # ===================================================================
-#  Core Automation
+#  ГЛАВНАЯ ЛОГИКА — Автоматизация
 # ===================================================================
-class WMSAutomation:
+class WMSBot:
 
-    def __init__(self, zone_lookup, log_cb=None, status_cb=None, target_pid=None):
-        self.zone_lookup = zone_lookup
+    def __init__(self, zones, fallback, pid=None, log_cb=None, status_cb=None):
+        self.zones = zones
+        self.fallback = fallback or FALLBACK_LOCATION
+        self.pid = pid
         self.log_cb = log_cb
         self.status_cb = status_cb
-        self.target_pid = target_pid  # PID целевого процесса
+
         self.running = False
         self.paused = False
-        self.poll_interval = 0.5
-        self.action_delay = 0.4
-        self.fallback = FALLBACK_LOCATION
-        self._suppress_kb = False
+        self.poll = 0.5       # интервал опроса
+        self.delay = 0.3      # задержка после действия
+        self._suppress = False  # подавление паузы при программных нажатиях
 
-    def log(self, msg, level="INFO"):
-        logger.log(getattr(logging, level, logging.INFO), msg)
+    def log(self, msg, lvl="INFO"):
+        logger.log(getattr(logging, lvl, 20), msg)
         if self.log_cb:
-            self.log_cb("[{}] {}".format(level, msg))
+            self.log_cb(f"[{lvl}] {msg}")
 
-    def _safe_send(self, keys):
-        """Отправить клавишу с подавлением авто-паузы."""
-        self._suppress_kb = True
+    def _send_key(self, key):
+        """Отправить клавишу БЕЗ срабатывания паузы."""
+        self._suppress = True
         try:
-            keyboard.send(keys)
+            keyboard.send(key)
         finally:
             time.sleep(0.05)
-            self._suppress_kb = False
+            self._suppress = False
 
-    # ---------- state detection ----------
-    def detect_state(self):
-        """Определяет текущее состояние по заголовку окна."""
-        pid = self.target_pid
+    # ------------------------------------------------------------------
+    #  Определение текущего окна — ЧТО СЕЙЧАС НА ЭКРАНЕ?
+    # ------------------------------------------------------------------
+    def detect(self):
+        """
+        Возвращает (тип_окна, окно) или ("unknown", None).
+        Порядок проверки важен: сначала модальные, потом основные.
+        """
+        pid = self.pid
 
-        # 0. Подтверждения
-        for title in ("Подтверждение", "Подтвердить", "Confirm",
-                       "Информация", "Information", "Сообщение", "Message"):
-            w = find_window_by_title(title, pid)
+        # Ошибка / предупреждение
+        for t in ("Ошибка", "Error", "Предупреждение", "Warning"):
+            w = find_window(t, pid)
             if w:
-                return S_CONFIRMATION, w
+                return "error", w
 
-        # 1. Ошибки
-        for title in ("Ошибка", "Error", "Предупреждение", "Warning"):
-            w = find_window_by_title(title, pid)
+        # Подтверждение / информация / сообщение
+        for t in ("Подтверждение", "Подтвердить", "Confirm",
+                   "Информация", "Information", "Сообщение", "Message"):
+            w = find_window(t, pid)
             if w:
-                return S_ERROR, w
+                return "confirm", w
 
-        # 2. Размещение в место
-        w = find_window_by_title("Размещение в место", pid)
+        # Размещение в место (скрин 11)
+        w = find_window("Размещение в место", pid)
         if w:
-            return S_PLACE_IN_LOC, w
+            return "place", w
 
-        # 3. Поиск места-приёмника
-        w = find_window_by_title("Поиск места-при", pid)  # приёмника / приемника
+        # Поиск места-приёмника (скрин 9/10/12)
+        w = find_window("Поиск места-при", pid)
         if not w:
-            w = find_window_by_title("Поиск места-приёмника", pid)
+            w = find_window("Поиск места-приёмника", pid)
         if not w:
-            w = find_window_by_title("Поиск места-приемника", pid)
+            w = find_window("Поиск места-приемника", pid)
         if w:
-            statics = " ".join(get_statics(w)).lower()
-            if "паллет" in statics or "содержимого" in statics:
-                return S_SEARCH_DEST_PALLET, w
-            return S_SEARCH_DEST_BOX, w
-
-        # 4. Поиск коробки
-        w = find_window_by_title("Поиск коробки", pid)
-        if w:
-            return S_SEARCH_BOX, w
-
-        # 5. Поиск палеты / паллеты
-        for t in ("Поиск палеты", "Поиск паллеты"):
-            w = find_window_by_title(t, pid)
-            if w:
-                return S_SEARCH_PALLET, w
-
-        # 6. Перемещение к источнику
-        w = find_window_by_title("Перемещение к источнику", pid)
-        if w:
-            return S_MOVE_TO_SOURCE, w
-
-        # 7. Взятие работы
-        w = find_window_by_title("Взятие работы", pid)
-        if w:
-            return S_TAKE_WORK, w
-
-        # 8. Главное меню
-        w = find_window_by_title("Главное меню", pid)
-        if w:
-            return S_MAIN_MENU, w
-
-        return S_UNKNOWN, None
-
-    # ---------- helpers ----------
-
-    def _press_f2(self, window):
-        try:
-            clicked = click_button(window, "F2")
-            if not clicked:
-                clicked = click_button(window, "Запросить")
-            if not clicked:
-                clicked = click_button(window, "Взять")
-            if not clicked:
-                window.set_focus()
-                time.sleep(0.05)
-                self._safe_send("F2")
-        except Exception as exc:
-            self.log("_press_f2 error: {}".format(exc), "ERROR")
-
-    def _check_confirmation(self):
-        """После действия — проверяем, не вылезло ли подтверждение."""
-        time.sleep(0.4)
-        st, w = self.detect_state()
-        if st == S_CONFIRMATION:
-            self.handle_confirmation(w)
-            return True
-        if st == S_ERROR:
-            self.handle_error(w)
-            return True
-        return False
-
-    # ---------- handlers ----------
-
-    def handle_main_menu(self, w):
-        self.log("→ Главное меню: нажимаю F2 (Запросить работу)")
-        self._press_f2(w)
-
-    def handle_take_work(self, w):
-        self.log("→ Взятие работы: нажимаю F2 (Взять работу)")
-        self._press_f2(w)
-
-    def handle_move_to_source(self, w):
-        self.log("→ Перемещение к источнику")
-        edits = get_edits(w)
-        edit_vals = [e.window_text().strip() for e in edits]
-        self.log("   Поля: {}".format(edit_vals))
-
-        source_edit = find_labeled_edit(w, "Место")
-        control_edit = find_labeled_edit(w, "Контроль")
-
-        if source_edit and control_edit:
-            src_val = source_edit.window_text().strip()
-            if src_val:
-                self.log("   Место='{}' → Контроль".format(src_val))
-                set_edit_value(control_edit, src_val)
-                time.sleep(0.1)
-                click_ok(w)
-                self._check_confirmation()
-                return
-
-        src, ctrl = find_source_and_control(edits)
-        if src and ctrl:
-            self.log("   (fallback) '{}' → Контроль".format(src))
-            set_edit_value(ctrl, src)
-            time.sleep(0.1)
-            click_ok(w)
-            self._check_confirmation()
-        else:
-            self.log("   Не удалось найти Место/Контроль", "WARNING")
-
-    def handle_search_pallet(self, w):
-        self.log("→ Поиск палеты")
-        edits = get_edits(w)
-        edit_vals = [e.window_text().strip() for e in edits]
-        self.log("   Поля: {}".format(edit_vals))
-
-        pallet_edit = find_labeled_edit(w, "Паллет")
-        control_edit = find_labeled_edit(w, "Контроль")
-
-        if pallet_edit and control_edit:
-            pallet_val = pallet_edit.window_text().strip()
-            if pallet_val:
-                self.log("   Паллета='{}' → Контроль  ✓".format(pallet_val))
-                set_edit_value(control_edit, pallet_val)
-                time.sleep(0.1)
-                click_ok(w)
-                self._check_confirmation()
-                return
+            # Определяем: коробка (скрин 9) или паллета (скрин 12)?
+            all_text = " ".join(get_statics(w)).lower()
+            if "паллет" in all_text or "содержимого" in all_text:
+                return "dest_pallet", w   # скрин 12
             else:
-                self.log("   Поле 'Паллета' пустое!", "WARNING")
-        else:
-            self.log("   Labeled поиск не удался (Паллет={}, Контроль={})".format(
-                pallet_edit is not None, control_edit is not None), "WARNING")
+                return "dest_box", w       # скрин 9
 
-        self.log("   Использую fallback-поиск...")
-        src, ctrl = find_source_and_control(edits)
-        if src and ctrl:
-            self.log("   (fallback) '{}' → Контроль".format(src))
-            set_edit_value(ctrl, src)
-            time.sleep(0.1)
-            click_ok(w)
-            self._check_confirmation()
-        else:
-            self.log("   Не удалось найти Паллета/Контроль", "WARNING")
+        # Поиск коробки (скрин 7)
+        w = find_window("Поиск коробки", pid)
+        if w:
+            return "box", w
 
-    def handle_search_box(self, w):
-        self.log("→ Поиск коробки")
-        edits = get_edits(w)
-        edit_vals = [e.window_text().strip() for e in edits]
-        self.log("   Поля: {}".format(edit_vals))
+        # Поиск паллеты (скрин 5)
+        w = find_window("Поиск паллеты", pid)
+        if not w:
+            w = find_window("Поиск палеты", pid)
+        if w:
+            return "pallet", w
 
-        box_edit = find_labeled_edit(w, "Коробк")
-        control_edit = find_labeled_edit(w, "Контроль")
+        # Перемещение к источнику (скрин 3)
+        w = find_window("Перемещение к источнику", pid)
+        if w:
+            return "move_source", w
 
-        if box_edit and control_edit:
-            box_val = box_edit.window_text().strip()
-            if box_val:
-                self.log("   Коробка='{}' → Контроль".format(box_val))
-                set_edit_value(control_edit, box_val)
+        # Взятие работы (скрин 2)
+        w = find_window("Взятие работы", pid)
+        if w:
+            return "take_work", w
+
+        # Главное меню (скрин 1)
+        w = find_window("Главное меню", pid)
+        if w:
+            return "main_menu", w
+
+        return "unknown", None
+
+    # ------------------------------------------------------------------
+    #  Обработчики каждого шага
+    # ------------------------------------------------------------------
+
+    def do_main_menu(self, w):
+        """Скрин 1: Главное меню → жмём F2 (Запросить работу)"""
+        self.log("→ [1] Главное меню: жму F2 (Запросить работу)")
+        if not click_f2_button(w):
+            try:
+                w.set_focus()
                 time.sleep(0.1)
+                self._send_key("F2")
+            except:
+                pass
+
+    def do_take_work(self, w):
+        """Скрин 2: Взятие работы → жмём F2 (Взять работу)"""
+        self.log("→ [2] Взятие работы: жму F2 (Взять работу)")
+        if not click_f2_button(w):
+            try:
+                w.set_focus()
+                time.sleep(0.1)
+                self._send_key("F2")
+            except:
+                pass
+
+    def do_move_source(self, w):
+        """Скрин 3-4: Перемещение к источнику → Место → Контроль → Ок"""
+        self.log("→ [3] Перемещение к источнику")
+
+        # Читаем значение из поля «Место»
+        edit_mesto = find_edit_near_label(w, "Место")
+        edit_ctrl  = find_edit_near_label(w, "Контроль")
+
+        if edit_mesto and edit_ctrl:
+            val = read_edit_value(edit_mesto)
+            ctrl_val = read_edit_value(edit_ctrl)
+
+            if val and not ctrl_val:
+                self.log(f"   Место='{val}' → Контроль")
+                write_edit_value(edit_ctrl, val)
+                time.sleep(0.15)
                 click_ok(w)
-                self._check_confirmation()
-                return
-
-        src, ctrl = find_source_and_control(edits)
-        if src and ctrl:
-            self.log("   (fallback) '{}' → Контроль".format(src))
-            set_edit_value(ctrl, src)
-            time.sleep(0.1)
-            click_ok(w)
-            self._check_confirmation()
+            elif val and ctrl_val:
+                # Уже заполнено (скрин 4) — просто жмём Ок
+                self.log(f"   Уже заполнено: Контроль='{ctrl_val}' → Ок")
+                click_ok(w)
+            else:
+                self.log("   Место пустое!", "WARNING")
         else:
-            self.log("   Не удалось найти Коробка/Контроль", "WARNING")
+            # Фоллбэк: по индексу
+            edits = get_edits(w)
+            self.log(f"   Edits: {[read_edit_value(e) for e in edits]}")
+            if len(edits) >= 2:
+                val = read_edit_value(edits[0])
+                if val:
+                    write_edit_value(edits[1], val)
+                    time.sleep(0.15)
+                    click_ok(w)
 
-    def handle_search_dest_box(self, w):
-        """Поиск места-приёмника (коробка). Зона → код из XLS → fallback."""
-        self.log("→ Поиск места-приёмника (коробка)")
-        statics = get_statics(w)
-        full_text = " ".join(statics)
-        self.log("   Текст: {}".format(full_text))
+    def do_pallet(self, w):
+        """Скрин 5-6: Поиск паллеты → Паллета → Контроль → Ок"""
+        self.log("→ [5] Поиск паллеты")
 
-        edits = get_edits(w)
-        edit_vals = [e.window_text().strip() for e in edits]
-        self.log("   Поля: {}".format(edit_vals))
+        edit_pallet = find_edit_near_label(w, "Паллет")
+        edit_ctrl   = find_edit_near_label(w, "Контроль")
 
-        zone_text = ""
-        m = re.search(r"[Зз]она[:\s]+(.+)", full_text)
+        if edit_pallet and edit_ctrl:
+            val = read_edit_value(edit_pallet)
+            ctrl_val = read_edit_value(edit_ctrl)
+
+            if val and not ctrl_val:
+                self.log(f"   Паллета='{val}' → Контроль")
+                write_edit_value(edit_ctrl, val)
+                time.sleep(0.15)
+                click_ok(w)
+            elif val and ctrl_val:
+                self.log(f"   Уже заполнено → Ок")
+                click_ok(w)
+            else:
+                self.log("   Паллета пустая!", "WARNING")
+        else:
+            # Фоллбэк по всем Edit
+            edits = get_edits(w)
+            vals = [read_edit_value(e) for e in edits]
+            self.log(f"   Fallback edits: {vals}")
+            # Ищем первое заполненное поле и первое пустое после него
+            src_val = None
+            target = None
+            for i, e in enumerate(edits):
+                v = read_edit_value(e)
+                if v and not src_val:
+                    # Это может быть "Из места" - пропускаем, берём следующее
+                    continue
+                if v and src_val is None:
+                    src_val = v
+                if not v and target is None:
+                    target = e
+            # Проще: берём предпоследнее заполненное и последнее пустое
+            for i in range(len(edits)-1, -1, -1):
+                if not read_edit_value(edits[i]):
+                    target = edits[i]
+                    break
+            for i in range(len(edits)-1, -1, -1):
+                v = read_edit_value(edits[i])
+                if v:
+                    src_val = v
+                    break
+            if src_val and target:
+                self.log(f"   Fallback: '{src_val}' → Контроль")
+                write_edit_value(target, src_val)
+                time.sleep(0.15)
+                click_ok(w)
+
+    def do_box(self, w):
+        """Скрин 7-8: Поиск коробки → Коробка → Контроль → Ок"""
+        self.log("→ [7] Поиск коробки")
+
+        edit_box  = find_edit_near_label(w, "Коробк")
+        edit_ctrl = find_edit_near_label(w, "Контроль")
+
+        if edit_box and edit_ctrl:
+            val = read_edit_value(edit_box)
+            ctrl_val = read_edit_value(edit_ctrl)
+
+            if val and not ctrl_val:
+                self.log(f"   Коробка='{val}' → Контроль")
+                write_edit_value(edit_ctrl, val)
+                time.sleep(0.15)
+                click_ok(w)
+            elif val and ctrl_val:
+                self.log(f"   Уже заполнено → Ок")
+                click_ok(w)
+            else:
+                self.log("   Коробка пустая!", "WARNING")
+        else:
+            edits = get_edits(w)
+            vals = [read_edit_value(e) for e in edits]
+            self.log(f"   Fallback edits: {vals}")
+            # Ищем последнее пустое
+            src_val = None
+            target = None
+            for i in range(len(edits)-1, -1, -1):
+                if not read_edit_value(edits[i]):
+                    target = edits[i]
+                    break
+            for i in range(len(edits)-1, -1, -1):
+                v = read_edit_value(edits[i])
+                if v:
+                    src_val = v
+                    break
+            if src_val and target:
+                write_edit_value(target, src_val)
+                time.sleep(0.15)
+                click_ok(w)
+
+    def do_dest_box(self, w):
+        """
+        Скрин 9-10: Поиск места-приёмника (КОРОБКА)
+        Читаем зону → ищем в XLS → вставляем код → Ок
+        Если ошибка → D-KM-1
+        """
+        self.log("→ [9] Поиск места-приёмника (коробка)")
+
+        all_text = " ".join(get_statics(w))
+        self.log(f"   Текст: {all_text}")
+
+        # Извлекаем зону: ищем текст после "Зона:" или "Док"
+        zone = ""
+        m = re.search(r"[Зз]она[:\s]+(.+)", all_text)
         if m:
-            zone_text = m.group(1).strip()
-        else:
-            m2 = re.search(r"(Док\s+.+)", full_text)
-            if m2:
-                zone_text = m2.group(1).strip()
+            zone = m.group(1).strip()
+            # Убираем лишнее (кнопки и т.д.)
+            zone = zone.split("\n")[0].strip()
 
-        self.log("   Зона: '{}'".format(zone_text))
+        self.log(f"   Зона: '{zone}'")
 
+        # Ищем код в XLS
         location = None
-        if zone_text:
-            location = self.zone_lookup.lookup(zone_text)
-
+        if zone:
+            location = self.zones.lookup(zone)
         if location:
-            self.log("   Найден код: {}".format(location))
+            self.log(f"   XLS → {location}")
         else:
             location = self.fallback
-            self.log("   Зона не найдена → fallback {}".format(location), "WARNING")
+            self.log(f"   Не найдено → fallback {location}")
 
-        ctrl = find_labeled_edit(w, "Контроль")
-        if not ctrl:
-            for ed in edits:
-                if not ed.window_text().strip():
-                    ctrl = ed
+        # Вставляем в Контроль
+        edit_ctrl = find_edit_near_label(w, "Контроль")
+        if not edit_ctrl:
+            edits = get_edits(w)
+            for e in edits:
+                if not read_edit_value(e):
+                    edit_ctrl = e
                     break
-        if not ctrl and edits:
-            ctrl = edits[-1]
+            if not edit_ctrl and edits:
+                edit_ctrl = edits[-1]
 
-        if ctrl:
-            set_edit_value(ctrl, location)
+        if edit_ctrl:
+            write_edit_value(edit_ctrl, location)
             time.sleep(0.15)
             click_ok(w)
 
+            # Ждём — может появиться ошибка
             time.sleep(0.8)
-            st, ew = self.detect_state()
-            if st == S_ERROR:
-                self.log("   Ошибка! Закрываю и пробую fallback", "WARNING")
+            typ, ew = self.detect()
+            if typ == "error":
+                self.log(f"   ❌ Ошибка! Закрываю → вставляю {self.fallback}")
                 click_ok(ew)
                 time.sleep(0.5)
-                st2, w2 = self.detect_state()
-                if st2 in (S_SEARCH_DEST_BOX, S_SEARCH_DEST_PALLET):
-                    ctrl2 = find_labeled_edit(w2, "Контроль")
-                    if not ctrl2:
-                        edits2 = get_edits(w2)
-                        for ed in edits2:
-                            if not ed.window_text().strip():
-                                ctrl2 = ed
+                # Снова появится окно места-приёмника
+                typ2, w2 = self.detect()
+                if typ2 in ("dest_box", "dest_pallet"):
+                    ec2 = find_edit_near_label(w2, "Контроль")
+                    if not ec2:
+                        eds = get_edits(w2)
+                        for e in eds:
+                            if not read_edit_value(e):
+                                ec2 = e
                                 break
-                        if not ctrl2 and edits2:
-                            ctrl2 = edits2[-1]
-                    if ctrl2:
-                        self.log("   Вставляю fallback: {}".format(self.fallback))
-                        set_edit_value(ctrl2, self.fallback)
+                    if ec2:
+                        write_edit_value(ec2, self.fallback)
                         time.sleep(0.15)
                         click_ok(w2)
-                        self._check_confirmation()
-            elif st == S_CONFIRMATION:
-                self.handle_confirmation(ew)
+            elif typ == "confirm":
+                click_ok(ew)
         else:
-            self.log("   Не найдено поле Контроль", "WARNING")
+            self.log("   Не найден Контроль!", "WARNING")
 
-    def handle_search_dest_pallet(self, w):
-        """Поиск места-приёмника (паллета): всегда fallback."""
-        self.log("→ Поиск места-приёмника (паллета): {}".format(self.fallback))
-        edits = get_edits(w)
+    def do_dest_pallet(self, w):
+        """
+        Скрин 12: Поиск места-приёмника (ПАЛЛЕТА)
+        ВСЕГДА вставляем D-KM-1 (fallback) → Ок
+        """
+        self.log(f"→ [12] Поиск места-приёмника (паллета): ВСЕГДА {self.fallback}")
 
-        ctrl = find_labeled_edit(w, "Контроль")
-        if not ctrl:
-            for ed in edits:
-                if not ed.window_text().strip():
-                    ctrl = ed
+        edit_ctrl = find_edit_near_label(w, "Контроль")
+        if not edit_ctrl:
+            edits = get_edits(w)
+            for e in edits:
+                if not read_edit_value(e):
+                    edit_ctrl = e
                     break
-        if not ctrl and edits:
-            ctrl = edits[-1]
+            if not edit_ctrl and edits:
+                edit_ctrl = edits[-1]
 
-        if ctrl:
-            set_edit_value(ctrl, self.fallback)
+        if edit_ctrl:
+            write_edit_value(edit_ctrl, self.fallback)
             time.sleep(0.15)
             click_ok(w)
-            self._check_confirmation()
         else:
-            self.log("   Не найдено поле Контроль", "WARNING")
+            self.log("   Не найден Контроль!", "WARNING")
 
-    def handle_place_in_loc(self, w):
-        self.log("→ Размещение в место: нажимаю Ок")
+    def do_place(self, w):
+        """Скрин 11: Размещение в место → просто Ок"""
+        self.log("→ [11] Размещение в место: жму Ок")
         click_ok(w)
-        self._check_confirmation()
 
-    def handle_confirmation(self, w):
-        self.log("→ Подтверждение: нажимаю Ок")
+    def do_error(self, w):
+        """Окно ошибки → закрываем (Ок)"""
+        txt = " ".join(get_statics(w))
+        self.log(f"→ Ошибка: {txt}")
         click_ok(w)
+
+    def do_confirm(self, w):
+        """Подтверждение → Ок"""
+        self.log("→ Подтверждение: жму Ок")
+        click_ok(w)
+        # Может вылезти ещё одно
         time.sleep(0.3)
-        st, w2 = self.detect_state()
-        if st == S_CONFIRMATION:
-            self.log("→ Ещё подтверждение: нажимаю Ок")
+        t2, w2 = self.detect()
+        if t2 == "confirm":
             click_ok(w2)
 
-    def handle_error(self, w):
-        try:
-            statics = get_statics(w)
-            self.log("→ Ошибка: {}".format(" ".join(statics)))
-        except Exception:
-            self.log("→ Ошибка (текст не прочитан)")
-        click_ok(w)
-
-    # ---------- main loop ----------
+    # ------------------------------------------------------------------
+    #  Главный цикл
+    # ------------------------------------------------------------------
     def run(self):
         self.running = True
         self.log("=" * 50)
-        self.log("Автоматизация запущена")
-        self.log("Fallback: {}  |  Зон: {}  |  PID: {}".format(
-            self.fallback, len(self.zone_lookup.mapping),
-            self.target_pid or "все процессы"))
+        self.log("🚀 Автоматизация ЗАПУЩЕНА")
+        self.log(f"   Fallback: {self.fallback}")
+        self.log(f"   Зон: {len(self.zones.mapping)}")
+        self.log(f"   PID: {self.pid or 'все'}")
         self.log("=" * 50)
 
-        handlers = {
-            S_MAIN_MENU:          self.handle_main_menu,
-            S_TAKE_WORK:          self.handle_take_work,
-            S_MOVE_TO_SOURCE:     self.handle_move_to_source,
-            S_SEARCH_PALLET:      self.handle_search_pallet,
-            S_SEARCH_BOX:         self.handle_search_box,
-            S_SEARCH_DEST_BOX:    self.handle_search_dest_box,
-            S_SEARCH_DEST_PALLET: self.handle_search_dest_pallet,
-            S_PLACE_IN_LOC:       self.handle_place_in_loc,
-            S_CONFIRMATION:       self.handle_confirmation,
-            S_ERROR:              self.handle_error,
+        HANDLERS = {
+            "main_menu":   self.do_main_menu,
+            "take_work":   self.do_take_work,
+            "move_source": self.do_move_source,
+            "pallet":      self.do_pallet,
+            "box":         self.do_box,
+            "dest_box":    self.do_dest_box,
+            "dest_pallet": self.do_dest_pallet,
+            "place":       self.do_place,
+            "error":       self.do_error,
+            "confirm":     self.do_confirm,
         }
 
         while self.running:
@@ -882,26 +802,26 @@ class WMSAutomation:
                 if self.status_cb:
                     self.status_cb("running")
 
-                state, window = self.detect_state()
+                typ, win = self.detect()
 
-                if state == S_UNKNOWN:
-                    time.sleep(self.poll_interval)
+                if typ == "unknown":
+                    time.sleep(self.poll)
                     continue
 
-                handler = handlers.get(state)
+                handler = HANDLERS.get(typ)
                 if handler:
-                    handler(window)
+                    handler(win)
 
-                time.sleep(self.action_delay)
+                time.sleep(self.delay)
 
-            except Exception as exc:
-                self.log("Ошибка в цикле: {}".format(exc), "ERROR")
-                time.sleep(1.0)
+            except Exception as e:
+                self.log(f"Ошибка: {e}", "ERROR")
+                time.sleep(1)
 
         if self.status_cb:
             self.status_cb("stopped")
         self.log("=" * 50)
-        self.log("Автоматизация остановлена")
+        self.log("⏹ Автоматизация ОСТАНОВЛЕНА")
         self.log("=" * 50)
 
     def stop(self):
@@ -913,549 +833,389 @@ class WMSAutomation:
 
 
 # ===================================================================
-#  GUI — Modern Dark Theme
+#  GUI
 # ===================================================================
-class AppGUI:
+class App:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WMS Автоматизация v3.1")
-        self.root.geometry("960x760")
+        self.root.title("WMS Автоматизация v4.0")
+        self.root.geometry("960x750")
         self.root.configure(bg=BG_DARK)
         self.root.resizable(True, True)
 
-        try:
-            self.root.iconbitmap(default="")
-        except Exception:
-            pass
-
-        self.automation = None
+        self.bot = None
         self.thread = None
-        self.zone_lookup = ZoneLookup()
+        self.zones = ZoneLookup()
+
+        self._sel_pid = None
+        self._procs = []
 
         self._arrow_x = -100
-        self._anim_running = False
-        self._status_mode = "stopped"
+        self._anim = False
+        self._mode = "stopped"
 
-        # Выбранный PID WMS-приложения (None = все процессы)
-        self._selected_pid = None
-        self._process_list = []  # список ProcessInfo
+        self._build()
+        self.root.after(200, self._auto_zones)
+        self.root.after(500, self._auto_scan)
 
-        self._configure_styles()
-        self._build_ui()
+        self._kb_hook = keyboard.on_press(self._on_key)
 
-        # Автозагрузка зон
-        self.root.after(200, self._auto_load_zones)
+    # ---------- UI ----------
+    def _build(self):
+        # Status bar
+        self.canvas = tk.Canvas(self.root, height=54, bg=C_BLUE, highlightthickness=0)
+        self.canvas.pack(fill=tk.X)
+        self.canvas.bind("<Configure>", lambda e: self._draw_bar())
 
-        # Автосканирование WMS-окон
-        self.root.after(500, self._auto_scan_wms)
+        main = tk.Frame(self.root, bg=BG_DARK)
+        main.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
 
-        # Хук: любая клавиша → пауза
-        self._kb_hook = keyboard.on_press(self._on_any_key_press)
+        # --- Приложение ---
+        f_app = tk.LabelFrame(main, text="  🖥  WMS-приложение  ",
+                               bg=BG_CARD, fg=C_CYAN, font=("Segoe UI", 10, "bold"))
+        f_app.pack(fill=tk.X, pady=(0,6))
 
-    # ----------------------------------------------------------------
-    def _configure_styles(self):
-        style = ttk.Style()
-        style.theme_use("clam")
+        r = tk.Frame(f_app, bg=BG_CARD)
+        r.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(r, text="Приложение:", bg=BG_CARD, fg=FG_TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self.var_app = tk.StringVar(value="(сканирование...)")
+        self.cmb = ttk.Combobox(r, textvariable=self.var_app, width=55,
+                                 state="readonly", font=("Segoe UI", 9))
+        self.cmb.pack(side=tk.LEFT, padx=8)
+        self.cmb.bind("<<ComboboxSelected>>", self._on_cmb)
 
-        style.configure("Dark.TFrame", background=BG_DARK)
-        style.configure("Card.TFrame", background=BG_CARD)
+        tk.Button(r, text="🔍 WMS", command=self._scan_wms,
+                  bg=C_BLUE, fg="white", relief="flat",
+                  font=("Segoe UI", 9, "bold"), padx=10, cursor="hand2"
+                  ).pack(side=tk.LEFT, padx=3)
+        tk.Button(r, text="📋 Все", command=self._scan_all,
+                  bg="#374151", fg=FG_TEXT, relief="flat",
+                  font=("Segoe UI", 9), padx=10, cursor="hand2"
+                  ).pack(side=tk.LEFT, padx=3)
 
-        style.configure("Dark.TLabel", background=BG_DARK,
-                         foreground=FG_TEXT, font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background=BG_CARD,
-                         foreground=FG_TEXT, font=("Segoe UI", 10))
-        style.configure("Dim.TLabel", background=BG_DARK,
-                         foreground=FG_DIM, font=("Segoe UI", 9))
-
-        style.configure("Dark.TLabelframe", background=BG_CARD,
-                         foreground=COLOR_CYAN)
-        style.configure("Dark.TLabelframe.Label", background=BG_CARD,
-                         foreground=COLOR_CYAN, font=("Segoe UI", 10, "bold"))
-
-        style.configure("Dark.TCombobox",
-                         fieldbackground=BG_INPUT, background=BG_INPUT,
-                         foreground=FG_TEXT, selectbackground=COLOR_BLUE)
-
-    # ----------------------------------------------------------------
-    def _build_ui(self):
-
-        # ===== ВЕРХНЯЯ ПАНЕЛЬ СТАТУСА =====
-        self.status_canvas = tk.Canvas(
-            self.root, height=54, bg=COLOR_BLUE, highlightthickness=0
-        )
-        self.status_canvas.pack(fill=tk.X, side=tk.TOP)
-        self.status_canvas.bind("<Configure>", lambda e: self._draw_status())
-
-        # ===== ОСНОВНАЯ ОБЛАСТЬ =====
-        main_frame = ttk.Frame(self.root, style="Dark.TFrame")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
-
-        # --- Выбор WMS-приложения ---
-        frm_app = ttk.LabelFrame(main_frame, text="🖥  WMS-приложение",
-                                   style="Dark.TLabelframe")
-        frm_app.pack(fill=tk.X, pady=(0, 6))
-
-        row_app = ttk.Frame(frm_app, style="Card.TFrame")
-        row_app.pack(fill=tk.X, padx=8, pady=6)
-
-        ttk.Label(row_app, text="Приложение:", style="Card.TLabel") \
-            .pack(side=tk.LEFT)
-
-        self.var_app = tk.StringVar(value="(автоопределение...)")
-        self.cmb_app = ttk.Combobox(
-            row_app, textvariable=self.var_app, width=60,
-            state="readonly", font=("Segoe UI", 9)
-        )
-        self.cmb_app.pack(side=tk.LEFT, padx=8)
-        self.cmb_app.bind("<<ComboboxSelected>>", self._on_app_selected)
-
-        self.btn_scan = tk.Button(
-            row_app, text="🔍 Сканировать", command=self._scan_apps,
-            bg=COLOR_BLUE, fg="white", activebackground=COLOR_BLUE_D,
-            relief="flat", font=("Segoe UI", 9, "bold"),
-            padx=10, cursor="hand2"
-        )
-        self.btn_scan.pack(side=tk.LEFT, padx=4)
-
-        self.btn_scan_all = tk.Button(
-            row_app, text="📋 Все окна", command=self._scan_all_apps,
-            bg="#374151", fg=FG_TEXT, activebackground="#4b5563",
-            relief="flat", font=("Segoe UI", 9),
-            padx=10, cursor="hand2"
-        )
-        self.btn_scan_all.pack(side=tk.LEFT, padx=4)
-
-        # Статус определения
-        self.lbl_app_status = ttk.Label(
-            frm_app, text="", style="Card.TLabel"
-        )
-        self.lbl_app_status.pack(anchor=tk.W, padx=12, pady=(0, 4))
+        self.lbl_app = tk.Label(f_app, text="", bg=BG_CARD, fg=FG_DIM,
+                                 font=("Segoe UI", 9))
+        self.lbl_app.pack(anchor=tk.W, padx=12, pady=(0,4))
 
         # --- Настройки ---
-        frm_set = ttk.LabelFrame(main_frame, text="⚙  Настройки",
-                                   style="Dark.TLabelframe")
-        frm_set.pack(fill=tk.X, pady=(0, 6))
+        f_set = tk.LabelFrame(main, text="  ⚙  Настройки  ",
+                               bg=BG_CARD, fg=C_CYAN, font=("Segoe UI", 10, "bold"))
+        f_set.pack(fill=tk.X, pady=(0,6))
 
-        row1 = ttk.Frame(frm_set, style="Card.TFrame")
-        row1.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(row1, text="📁 Файл зон:", style="Card.TLabel").pack(side=tk.LEFT)
+        r1 = tk.Frame(f_set, bg=BG_CARD)
+        r1.pack(fill=tk.X, padx=8, pady=4)
+        tk.Label(r1, text="📁 Файл зон:", bg=BG_CARD, fg=FG_TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self.var_xls = tk.StringVar()
-        tk.Entry(row1, textvariable=self.var_xls, width=52,
+        tk.Entry(r1, textvariable=self.var_xls, width=48,
                  bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT,
                  relief="flat", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=8)
-        tk.Button(row1, text="Обзор…", command=self._browse_xls,
-                  bg=COLOR_BLUE, fg="white", activebackground=COLOR_BLUE_D,
-                  relief="flat", font=("Segoe UI", 9, "bold"),
-                  padx=14, cursor="hand2").pack(side=tk.LEFT)
+        tk.Button(r1, text="Обзор…", command=self._browse,
+                  bg=C_BLUE, fg="white", relief="flat",
+                  font=("Segoe UI", 9, "bold"), padx=12, cursor="hand2"
+                  ).pack(side=tk.LEFT)
 
-        row2 = ttk.Frame(frm_set, style="Card.TFrame")
-        row2.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(row2, text="📍 Fallback:", style="Card.TLabel").pack(side=tk.LEFT)
-        self.var_fallback = tk.StringVar(value=FALLBACK_LOCATION)
-        tk.Entry(row2, textvariable=self.var_fallback, width=12,
+        r2 = tk.Frame(f_set, bg=BG_CARD)
+        r2.pack(fill=tk.X, padx=8, pady=4)
+        tk.Label(r2, text="📍 Fallback:", bg=BG_CARD, fg=FG_TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self.var_fb = tk.StringVar(value=FALLBACK_LOCATION)
+        tk.Entry(r2, textvariable=self.var_fb, width=12,
                  bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT,
                  relief="flat", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=8)
-        ttk.Label(row2, text="⏱ Интервал (сек):", style="Card.TLabel") \
-            .pack(side=tk.LEFT, padx=(20, 0))
-        self.var_interval = tk.StringVar(value="0.5")
-        tk.Entry(row2, textvariable=self.var_interval, width=6,
+        tk.Label(r2, text="⏱ Интервал:", bg=BG_CARD, fg=FG_TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(20,0))
+        self.var_poll = tk.StringVar(value="0.5")
+        tk.Entry(r2, textvariable=self.var_poll, width=6,
                  bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT,
                  relief="flat", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=8)
-        self.lbl_zones_count = ttk.Label(row2, text="Зон: 0", style="Card.TLabel")
-        self.lbl_zones_count.pack(side=tk.RIGHT, padx=10)
+        self.lbl_zn = tk.Label(r2, text="Зон: 0", bg=BG_CARD, fg=FG_TEXT,
+                                font=("Segoe UI", 10))
+        self.lbl_zn.pack(side=tk.RIGHT, padx=10)
 
-        # --- Таблица зон ---
-        frm_zones = ttk.LabelFrame(
-            main_frame,
-            text="📋  Загруженные зоны",
-            style="Dark.TLabelframe"
-        )
-        frm_zones.pack(fill=tk.X, pady=(0, 6))
-
-        zones_inner = ttk.Frame(frm_zones, style="Card.TFrame")
-        zones_inner.pack(fill=tk.X, padx=5, pady=5)
-        self.zones_text = tk.Text(
-            zones_inner, height=4, bg=BG_INPUT, fg=FG_TEXT,
-            font=("Consolas", 9), relief="flat",
-            insertbackground=FG_TEXT, state=tk.DISABLED,
-            selectbackground=COLOR_BLUE
-        )
-        z_scroll = ttk.Scrollbar(zones_inner, command=self.zones_text.yview)
-        self.zones_text.configure(yscrollcommand=z_scroll.set)
-        z_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.zones_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # --- Зоны ---
+        f_z = tk.LabelFrame(main, text="  📋  Зоны  ",
+                             bg=BG_CARD, fg=C_CYAN, font=("Segoe UI", 10, "bold"))
+        f_z.pack(fill=tk.X, pady=(0,6))
+        fi = tk.Frame(f_z, bg=BG_CARD)
+        fi.pack(fill=tk.X, padx=5, pady=5)
+        self.txt_z = tk.Text(fi, height=3, bg=BG_INPUT, fg=FG_TEXT,
+                              font=("Consolas", 9), relief="flat",
+                              state=tk.DISABLED)
+        sc = ttk.Scrollbar(fi, command=self.txt_z.yview)
+        self.txt_z.configure(yscrollcommand=sc.set)
+        sc.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_z.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # --- Лог ---
-        frm_log = ttk.LabelFrame(main_frame, text="📝  Лог",
-                                   style="Dark.TLabelframe")
-        frm_log.pack(fill=tk.BOTH, expand=True, pady=(0, 2))
-
+        f_l = tk.LabelFrame(main, text="  📝  Лог  ",
+                             bg=BG_CARD, fg=C_CYAN, font=("Segoe UI", 10, "bold"))
+        f_l.pack(fill=tk.BOTH, expand=True, pady=(0,2))
         self.txt_log = scrolledtext.ScrolledText(
-            frm_log, height=10, state=tk.DISABLED,
+            f_l, height=10, state=tk.DISABLED,
             font=("Consolas", 9), bg="#0d1117", fg="#c9d1d9",
-            insertbackground="#c9d1d9", relief="flat",
-            selectbackground=COLOR_BLUE
-        )
-        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 2))
+            relief="flat", selectbackground=C_BLUE)
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5,2))
+        tk.Button(f_l, text="🗑 Очистить", command=self._clear_log,
+                  bg="#374151", fg=FG_TEXT, relief="flat",
+                  font=("Segoe UI", 8), cursor="hand2"
+                  ).pack(anchor=tk.W, padx=5, pady=(0,5))
 
-        tk.Button(frm_log, text="🗑 Очистить лог", command=self._clear_log,
-                  bg="#374151", fg=FG_TEXT, activebackground="#4b5563",
-                  relief="flat", font=("Segoe UI", 8),
-                  cursor="hand2").pack(anchor=tk.W, padx=5, pady=(0, 5))
+        # --- Кнопки ---
+        bot = tk.Frame(self.root, bg=BAR_BG)
+        bot.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Label(bot, text="💡 Любая клавиша = пауза",
+                 bg=BAR_BG, fg=FG_DIM, font=("Segoe UI", 9)).pack(pady=(8,3))
 
-        # ===== НИЖНЯЯ ПАНЕЛЬ =====
-        bottom = tk.Frame(self.root, bg=BOTTOM_BAR)
-        bottom.pack(fill=tk.X, side=tk.BOTTOM)
-
-        tk.Label(
-            bottom,
-            text="💡 Любая клавиша = пауза   |   Кнопки ниже для управления",
-            bg=BOTTOM_BAR, fg=FG_DIM, font=("Segoe UI", 9)
-        ).pack(side=tk.TOP, pady=(8, 3))
-
-        btn_frame = tk.Frame(bottom, bg=BOTTOM_BAR)
-        btn_frame.pack(pady=(0, 10))
+        bf = tk.Frame(bot, bg=BAR_BG)
+        bf.pack(pady=(0,10))
 
         self.btn_start = tk.Button(
-            btn_frame, text="▶  Начать перемещение", command=self._on_start,
-            bg=COLOR_GREEN, fg="white", activebackground=COLOR_GREEN_L,
-            relief="flat", font=("Segoe UI", 12, "bold"),
-            padx=24, pady=8, cursor="hand2"
-        )
+            bf, text="▶  Старт", command=self._start,
+            bg=C_GREEN, fg="white", relief="flat",
+            font=("Segoe UI", 12, "bold"), padx=24, pady=8, cursor="hand2")
         self.btn_start.pack(side=tk.LEFT, padx=10)
 
         self.btn_pause = tk.Button(
-            btn_frame, text="⏸  Пауза", command=self._on_pause,
-            bg=COLOR_YELLOW, fg="#1a1a2e", activebackground=COLOR_YELLOW_L,
-            relief="flat", font=("Segoe UI", 12, "bold"),
-            padx=24, pady=8, cursor="hand2", state=tk.DISABLED
-        )
+            bf, text="⏸  Пауза", command=self._pause,
+            bg=C_YELLOW, fg="#1a1a2e", relief="flat",
+            font=("Segoe UI", 12, "bold"), padx=24, pady=8,
+            cursor="hand2", state=tk.DISABLED)
         self.btn_pause.pack(side=tk.LEFT, padx=10)
 
         self.btn_stop = tk.Button(
-            btn_frame, text="⏹  Стоп", command=self._on_stop,
-            bg=COLOR_ORANGE, fg="white", activebackground="#f97316",
-            relief="flat", font=("Segoe UI", 12, "bold"),
-            padx=24, pady=8, cursor="hand2", state=tk.DISABLED
-        )
+            bf, text="⏹  Стоп", command=self._stop,
+            bg=C_ORANGE, fg="white", relief="flat",
+            font=("Segoe UI", 12, "bold"), padx=24, pady=8,
+            cursor="hand2", state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=10)
 
-        self.btn_exit = tk.Button(
-            btn_frame, text="✕  Выход", command=self._on_close,
-            bg=COLOR_RED, fg="white", activebackground=COLOR_RED_L,
-            relief="flat", font=("Segoe UI", 12, "bold"),
-            padx=24, pady=8, cursor="hand2"
-        )
-        self.btn_exit.pack(side=tk.LEFT, padx=10)
+        tk.Button(
+            bf, text="✕  Выход", command=self._close,
+            bg=C_RED, fg="white", relief="flat",
+            font=("Segoe UI", 12, "bold"), padx=24, pady=8,
+            cursor="hand2").pack(side=tk.LEFT, padx=10)
 
-    # ================================================================
-    #  Status bar animation
-    # ================================================================
-    def _draw_status(self):
-        c = self.status_canvas
+    # ---------- Status bar ----------
+    def _draw_bar(self):
+        c = self.canvas
         c.delete("all")
         w = c.winfo_width()
         h = c.winfo_height()
-
-        if self._status_mode == "running":
-            c.configure(bg=COLOR_GREEN)
+        if self._mode == "running":
+            c.configure(bg=C_GREEN)
             for i in range(10):
                 ax = self._arrow_x + i * 50
-                if -30 < ax < w + 30:
-                    c.create_text(
-                        ax, h // 2, text="›",
-                        fill=COLOR_GREEN_L,
-                        font=("Segoe UI", 30, "bold")
-                    )
-            c.create_text(
-                w // 2, h // 2, text="▶  ИДЁТ ПЕРЕМЕЩЕНИЕ",
-                fill="white", font=("Segoe UI", 16, "bold")
-            )
-        elif self._status_mode == "paused":
-            c.configure(bg=COLOR_BLUE)
-            c.create_text(
-                w // 2, h // 2, text="⏸  ПАУЗА",
-                fill="white", font=("Segoe UI", 16, "bold")
-            )
+                if -30 < ax < w+30:
+                    c.create_text(ax, h//2, text="›", fill=C_GREEN_L,
+                                  font=("Segoe UI", 30, "bold"))
+            c.create_text(w//2, h//2, text="▶  РАБОТАЕТ",
+                          fill="white", font=("Segoe UI", 16, "bold"))
+        elif self._mode == "paused":
+            c.configure(bg=C_BLUE)
+            c.create_text(w//2, h//2, text="⏸  ПАУЗА",
+                          fill="white", font=("Segoe UI", 16, "bold"))
         else:
-            c.configure(bg=COLOR_BLUE)
-            c.create_text(
-                w // 2, h // 2, text="⏹  ПРОГРАММА НЕ ЗАПУЩЕНА",
-                fill="white", font=("Segoe UI", 16, "bold")
-            )
+            c.configure(bg=C_BLUE)
+            c.create_text(w//2, h//2, text="⏹  ОСТАНОВЛЕНО",
+                          fill="white", font=("Segoe UI", 16, "bold"))
 
-    def _start_animation(self):
-        if self._anim_running:
+    def _anim_tick(self):
+        if not self._anim:
             return
-        self._anim_running = True
-        self._animate_tick()
-
-    def _stop_animation(self):
-        self._anim_running = False
-
-    def _animate_tick(self):
-        if not self._anim_running:
-            return
-        if self._status_mode == "running":
-            w = self.status_canvas.winfo_width() or 960
+        if self._mode == "running":
+            w = self.canvas.winfo_width() or 960
             self._arrow_x += 4
-            if self._arrow_x > w + 50:
+            if self._arrow_x > w+50:
                 self._arrow_x = -500
-        self._draw_status()
-        self.root.after(50, self._animate_tick)
+        self._draw_bar()
+        self.root.after(50, self._anim_tick)
 
-    def _set_status_mode(self, mode):
-        self._status_mode = mode
-        if mode == "running":
-            self._start_animation()
+    def _set_mode(self, m):
+        self._mode = m
+        if m == "running" and not self._anim:
+            self._anim = True
+            self._anim_tick()
         else:
-            self._draw_status()
+            self._draw_bar()
 
-    # ================================================================
-    #  App scanning
-    # ================================================================
-    def _auto_scan_wms(self):
-        """Автосканирование WMS при запуске."""
-        self._add_log("🔍 Автосканирование WMS-окон...")
+    # ---------- Scanning ----------
+    def _auto_scan(self):
+        self._log("🔍 Автопоиск WMS...")
+        def do():
+            ps = find_wms_processes()
+            self.root.after(0, lambda: self._apply_scan(ps))
+        threading.Thread(target=do, daemon=True).start()
 
-        def _do_scan():
-            procs = scan_wms_windows()
-            self.root.after(0, lambda: self._apply_scan_results(procs, auto=True))
+    def _scan_wms(self):
+        self._log("🔍 Поиск WMS...")
+        def do():
+            ps = find_wms_processes()
+            self.root.after(0, lambda: self._apply_scan(ps))
+        threading.Thread(target=do, daemon=True).start()
 
-        threading.Thread(target=_do_scan, daemon=True).start()
+    def _scan_all(self):
+        self._log("📋 Все окна...")
+        def do():
+            ps = find_all_visible()
+            self.root.after(0, lambda: self._apply_scan(ps))
+        threading.Thread(target=do, daemon=True).start()
 
-    def _scan_apps(self):
-        """Кнопка «Сканировать» — ищет только WMS-окна."""
-        self._add_log("🔍 Сканирование WMS-окон...")
-        self.btn_scan.config(state=tk.DISABLED)
-
-        def _do_scan():
-            procs = scan_wms_windows()
-            self.root.after(0, lambda: self._apply_scan_results(procs, auto=False))
-            self.root.after(0, lambda: self.btn_scan.config(state=tk.NORMAL))
-
-        threading.Thread(target=_do_scan, daemon=True).start()
-
-    def _scan_all_apps(self):
-        """Кнопка «Все окна» — показывает все GUI-приложения."""
-        self._add_log("📋 Сканирование всех окон...")
-        self.btn_scan_all.config(state=tk.DISABLED)
-
-        def _do_scan():
-            procs = scan_all_gui_windows()
-            self.root.after(0, lambda: self._apply_scan_results(procs, auto=False, all_mode=True))
-            self.root.after(0, lambda: self.btn_scan_all.config(state=tk.NORMAL))
-
-        threading.Thread(target=_do_scan, daemon=True).start()
-
-    def _apply_scan_results(self, procs, auto=False, all_mode=False):
-        """Применяет результаты сканирования к ComboBox."""
-        self._process_list = procs
-
-        # Формируем варианты для ComboBox
-        values = ["(Все процессы — без фильтра)"]
-        for p in procs:
-            values.append(str(p))
-
-        self.cmb_app["values"] = values
+    def _apply_scan(self, procs):
+        self._procs = procs
+        vals = ["(Все процессы — без фильтра)"]
+        for p, n, t in procs:
+            vals.append(f"[PID:{p}] {n} — «{t}»")
+        self.cmb["values"] = vals
 
         if len(procs) == 0:
             self.var_app.set("(Все процессы — без фильтра)")
-            self._selected_pid = None
-            if auto:
-                self.lbl_app_status.config(
-                    text="⚠ WMS-окна не найдены. Нажмите «Сканировать» или «Все окна» для выбора.",
-                    foreground=COLOR_YELLOW
-                )
-                self._add_log("⚠ WMS-окна не найдены автоматически. "
-                              "Откройте WMS и нажмите «Сканировать».")
-            else:
-                if all_mode:
-                    self.lbl_app_status.config(
-                        text="Найдено {} окон. Выберите нужное.".format(len(procs)),
-                        foreground=FG_TEXT
-                    )
-                else:
-                    self.lbl_app_status.config(
-                        text="⚠ WMS-окна не найдены. Попробуйте «Все окна».",
-                        foreground=COLOR_YELLOW
-                    )
+            self._sel_pid = None
+            self.lbl_app.config(text="⚠ WMS не найден. Откройте WMS и нажмите 🔍",
+                                 fg=C_YELLOW)
+            self._log("⚠ WMS-окна не найдены")
         elif len(procs) == 1:
-            # Автовыбор единственного
-            self._selected_pid = procs[0].pid
-            self.var_app.set(str(procs[0]))
-            self.lbl_app_status.config(
-                text="✅ Найдено WMS-приложение: {} (PID:{})".format(
-                    procs[0].name, procs[0].pid),
-                foreground=COLOR_GREEN_L
-            )
-            self._add_log("✅ WMS найден: {} (PID:{})".format(
-                procs[0].name, procs[0].pid))
+            self._sel_pid = procs[0][0]
+            self.var_app.set(vals[1])
+            self.lbl_app.config(text=f"✅ Найден: {procs[0][1]} (PID:{procs[0][0]})",
+                                 fg=C_GREEN_L)
+            self._log(f"✅ WMS: {procs[0][1]} PID:{procs[0][0]}")
         else:
-            # Несколько — автовыбор первого
-            self._selected_pid = procs[0].pid
-            self.var_app.set(str(procs[0]))
-            self.lbl_app_status.config(
-                text="✅ Найдено {} приложений. Выбрано: {} (PID:{})".format(
-                    len(procs), procs[0].name, procs[0].pid),
-                foreground=COLOR_GREEN_L
-            )
-            self._add_log("✅ Найдено {} WMS-окон. Выбрано: {} (PID:{})".format(
-                len(procs), procs[0].name, procs[0].pid))
+            self._sel_pid = procs[0][0]
+            self.var_app.set(vals[1])
+            self.lbl_app.config(
+                text=f"✅ Найдено {len(procs)} прил. Выбрано: {procs[0][1]}",
+                fg=C_GREEN_L)
+            self._log(f"✅ Найдено {len(procs)} WMS-окон")
 
-    def _on_app_selected(self, event=None):
-        """Пользователь выбрал приложение из списка."""
-        idx = self.cmb_app.current()
+    def _on_cmb(self, e=None):
+        idx = self.cmb.current()
         if idx <= 0:
-            # «Все процессы»
-            self._selected_pid = None
-            self.lbl_app_status.config(
-                text="ℹ Работа без фильтра по процессу",
-                foreground=COLOR_CYAN
-            )
-            self._add_log("ℹ Выбран режим: все процессы (без фильтра)")
+            self._sel_pid = None
+            self.lbl_app.config(text="ℹ Без фильтра", fg=C_CYAN)
         else:
-            proc = self._process_list[idx - 1]
-            self._selected_pid = proc.pid
-            self.lbl_app_status.config(
-                text="✅ Выбрано: {} (PID:{})".format(proc.name, proc.pid),
-                foreground=COLOR_GREEN_L
-            )
-            self._add_log("✅ Выбрано: {} (PID:{})".format(proc.name, proc.pid))
+            p = self._procs[idx-1]
+            self._sel_pid = p[0]
+            self.lbl_app.config(text=f"✅ {p[1]} PID:{p[0]}", fg=C_GREEN_L)
 
-    # ================================================================
-    #  Auto-load zones
-    # ================================================================
-    def _auto_load_zones(self):
-        path = self.zone_lookup.auto_find_and_load()
-        if path:
-            self.var_xls.set(path)
-            self._add_log("✅ Автозагрузка зон: {}".format(os.path.basename(path)))
-            self._update_zones_display()
+    # ---------- Zones ----------
+    def _auto_zones(self):
+        p = self.zones.auto_find()
+        if p:
+            self.var_xls.set(p)
+            self._log(f"✅ Зоны: {os.path.basename(p)}")
+            self._show_zones()
         else:
-            self._add_log("ℹ️  Файл зон не найден автоматически. Загрузите через «Обзор».")
+            self._log("ℹ Файл зон не найден. Загрузите через «Обзор»")
 
-    def _update_zones_display(self):
-        n = len(self.zone_lookup.mapping)
-        self.lbl_zones_count.config(text="Зон: {}".format(n))
-        self.zones_text.config(state=tk.NORMAL)
-        self.zones_text.delete("1.0", tk.END)
-        if self.zone_lookup.display_mapping:
-            for key, val in self.zone_lookup.display_mapping.items():
-                self.zones_text.insert(tk.END, "  {}  →  {}\n".format(key, val))
+    def _browse(self):
+        p = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
+        if p:
+            self.var_xls.set(p)
+            self.zones.load(p)
+            self._log(f"📁 Загружен: {os.path.basename(p)}")
+            self._show_zones()
+
+    def _show_zones(self):
+        self.lbl_zn.config(text=f"Зон: {len(self.zones.mapping)}")
+        self.txt_z.config(state=tk.NORMAL)
+        self.txt_z.delete("1.0", tk.END)
+        if self.zones.display:
+            for k, v in self.zones.display.items():
+                self.txt_z.insert(tk.END, f"  {k}  →  {v}\n")
         else:
-            self.zones_text.insert(
-                tk.END, "  (пусто — загрузите файл зон через «Обзор»)\n"
-            )
-        self.zones_text.config(state=tk.DISABLED)
+            self.txt_z.insert(tk.END, "  (пусто)\n")
+        self.txt_z.config(state=tk.DISABLED)
 
-    # ================================================================
-    #  Callbacks
-    # ================================================================
-    def _browse_xls(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Excel", "*.xlsx *.xls"), ("All", "*.*")]
-        )
-        if path:
-            self.var_xls.set(path)
-            self.zone_lookup.load(path)
-            self._add_log("📁 Загружен: {}".format(os.path.basename(path)))
-            self._update_zones_display()
-
-    def _add_log(self, msg):
+    # ---------- Log ----------
+    def _log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
-        def _insert():
+        def ins():
             self.txt_log.config(state=tk.NORMAL)
-            self.txt_log.insert(tk.END, "[{}] {}\n".format(ts, msg))
+            self.txt_log.insert(tk.END, f"[{ts}] {msg}\n")
             self.txt_log.see(tk.END)
             self.txt_log.config(state=tk.DISABLED)
-        self.root.after(0, _insert)
+        self.root.after(0, ins)
 
     def _clear_log(self):
         self.txt_log.config(state=tk.NORMAL)
         self.txt_log.delete("1.0", tk.END)
         self.txt_log.config(state=tk.DISABLED)
 
-    def _status_callback(self, mode):
-        self.root.after(0, lambda m=mode: self._set_status_mode(m))
-
-    def _on_any_key_press(self, event):
-        if (self.automation
-                and self.automation.running
-                and not self.automation.paused
-                and not self.automation._suppress_kb):
-            self.automation.paused = True
-            self.automation.log("⏸ ПАУЗА (клавиша: {})".format(event.name))
-            self.root.after(0, lambda: self._set_status_mode("paused"))
+    # ---------- Keyboard ----------
+    def _on_key(self, ev):
+        if (self.bot and self.bot.running
+                and not self.bot.paused
+                and not self.bot._suppress):
+            self.bot.paused = True
+            self.bot.log(f"⏸ ПАУЗА (клавиша: {ev.name})")
+            self.root.after(0, lambda: self._set_mode("paused"))
             self.root.after(0, lambda: self.btn_pause.config(text="▶  Продолжить"))
 
-    def _on_start(self):
-        fb = self.var_fallback.get().strip() or FALLBACK_LOCATION
-
+    # ---------- Controls ----------
+    def _start(self):
         xls = self.var_xls.get().strip()
         if xls and os.path.exists(xls):
-            self.zone_lookup.load(xls)
-            self._update_zones_display()
+            self.zones.load(xls)
+            self._show_zones()
 
-        self.automation = WMSAutomation(
-            self.zone_lookup,
-            log_cb=self._add_log,
-            status_cb=self._status_callback,
-            target_pid=self._selected_pid
+        fb = self.var_fb.get().strip() or FALLBACK_LOCATION
+
+        self.bot = WMSBot(
+            self.zones, fb, self._sel_pid,
+            log_cb=self._log,
+            status_cb=lambda m: self.root.after(0, lambda: self._set_mode(m))
         )
-        self.automation.fallback = fb
         try:
-            self.automation.poll_interval = float(self.var_interval.get())
-        except ValueError:
+            self.bot.poll = float(self.var_poll.get())
+        except:
             pass
 
-        self.thread = threading.Thread(target=self.automation.run, daemon=True)
+        self.thread = threading.Thread(target=self.bot.run, daemon=True)
         self.thread.start()
 
         self.btn_start.config(state=tk.DISABLED, bg="#374151")
         self.btn_pause.config(state=tk.NORMAL, text="⏸  Пауза")
         self.btn_stop.config(state=tk.NORMAL)
-        self._set_status_mode("running")
+        self._set_mode("running")
 
-    def _on_pause(self):
-        if self.automation:
-            self.automation.toggle_pause()
-            if self.automation.paused:
-                self._set_status_mode("paused")
+    def _pause(self):
+        if self.bot:
+            self.bot.toggle_pause()
+            if self.bot.paused:
+                self._set_mode("paused")
                 self.btn_pause.config(text="▶  Продолжить")
             else:
-                self._set_status_mode("running")
+                self._set_mode("running")
                 self.btn_pause.config(text="⏸  Пауза")
 
-    def _on_stop(self):
-        if self.automation:
-            self.automation.stop()
-        self.btn_start.config(state=tk.NORMAL, bg=COLOR_GREEN)
+    def _stop(self):
+        if self.bot:
+            self.bot.stop()
+        self.btn_start.config(state=tk.NORMAL, bg=C_GREEN)
         self.btn_pause.config(state=tk.DISABLED, text="⏸  Пауза")
         self.btn_stop.config(state=tk.DISABLED)
-        self._stop_animation()
-        self._set_status_mode("stopped")
+        self._anim = False
+        self._set_mode("stopped")
 
-    def run(self):
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._draw_status()
-        self.root.mainloop()
-
-    def _on_close(self):
-        if self.automation:
-            self.automation.stop()
+    def _close(self):
+        if self.bot:
+            self.bot.stop()
         try:
             keyboard.unhook(self._kb_hook)
-        except Exception:
+        except:
             pass
-        self._stop_animation()
+        self._anim = False
         self.root.destroy()
 
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        self._draw_bar()
+        self.root.mainloop()
+
 
 # ===================================================================
-#  Entry point
-# ===================================================================
 if __name__ == "__main__":
-    app = AppGUI()
-    app.run()
+    App().run()
