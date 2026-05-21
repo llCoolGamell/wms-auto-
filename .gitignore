@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.spec
+wms_auto.log
+*.xlsx
+!zones.example.xlsx
